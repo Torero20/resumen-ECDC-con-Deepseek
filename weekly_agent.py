@@ -122,6 +122,8 @@ class WeeklyReportAgent:
         """Plan A: URL directa del PDF por semana ISO; retrocede hasta 4 semanas si hace falta."""
         today = dt.date.today()
         year, current_week, _ = today.isocalendar()
+        
+        logging.info("🔍 Buscando PDF para semana actual: %s-%s", current_week, year)
 
         # Probar desde la semana actual hasta 4 semanas atrás
         for weeks_back in range(0, 5):
@@ -135,9 +137,11 @@ class WeeklyReportAgent:
                 week_to_try = last_week_prev_year + week_to_try
 
             url = self.config.direct_pdf_template.format(week=week_to_try, year=year_to_try)
+            logging.debug("Probando URL: %s", url)
+            
             try:
                 h = self.session.head(url, timeout=10, allow_redirects=True)
-                logging.debug("Probando semana %s-%s: %s -> %s", week_to_try, year_to_try, url, h.status_code)
+                logging.debug("Respuesta HEAD: %s - Content-Type: %s", h.status_code, h.headers.get("Content-Type", ""))
                 
                 ct = h.headers.get("Content-Type", "").lower()
                 content_length = h.headers.get("Content-Length", "0")
@@ -148,36 +152,47 @@ class WeeklyReportAgent:
                     int(content_length) > 10000):
                     logging.info("✅ PDF directo encontrado: semana %s-%s", week_to_try, year_to_try)
                     return url
+                else:
+                    logging.debug("URL no válida: status=%s, type=%s, size=%s", 
+                                 h.status_code, ct, content_length)
                     
             except requests.RequestException as e:
                 logging.debug("Error probando %s: %s", url, e)
                 continue
                 
+        logging.info("❌ No se encontró PDF por URL directa")
         return None
 
     def _scan_listing_page(self) -> Optional[str]:
         """Plan B: rastrea la página de listados y devuelve el PDF más reciente."""
         try:
+            logging.info("🌐 Cargando página de listados: %s", self.config.base_url)
             r = self.session.get(self.config.base_url, timeout=20)
             r.raise_for_status()
+            logging.debug("Página cargada: %d caracteres", len(r.text))
         except requests.RequestException as e:
             logging.warning("No se pudo cargar la página de listados: %s", e)
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
         candidates: List[Tuple[dt.datetime, str]] = []
+        found_links = 0
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if not href:
                 continue
+                
             if not href.startswith("http"):
                 href = requests.compat.urljoin(self.config.base_url, href)
 
             m = self.config.pdf_regex.search(href)
             if m:
+                found_links += 1
                 week = int(m.group(1))
                 year = int(m.group(2))
+                
+                logging.debug("Encontrado enlace PDF: %s (semana %s-%s)", href, week, year)
                 
                 # Convertir año/semana a datetime para ordenar correctamente
                 try:
@@ -189,14 +204,21 @@ class WeeklyReportAgent:
                         ct = h.headers.get("Content-Type", "").lower()
                         if h.status_code == 200 and "pdf" in ct:
                             candidates.append((pdf_date, href))
-                            logging.debug("Candidato OK: %s (semana %s-%s)", href, week, year)
-                    except requests.RequestException:
+                            logging.debug("✅ Candidato válido: %s", href)
+                        else:
+                            logging.debug("❌ Enlace no válido: status=%s, type=%s", h.status_code, ct)
+                    except requests.RequestException as e:
+                        logging.debug("Error verificando enlace %s: %s", href, e)
                         continue
                         
-                except ValueError:
+                except ValueError as e:
+                    logging.debug("Error en fecha para %s: %s", href, e)
                     continue
 
+        logging.info("📊 Enlaces PDF encontrados: %d totales, %d válidos", found_links, len(candidates))
+
         if not candidates:
+            logging.info("❌ No se encontraron PDFs válidos en la página")
             return None
 
         # Ordenar por fecha descendente (más reciente primero)
@@ -204,7 +226,8 @@ class WeeklyReportAgent:
         
         # Tomar el más reciente
         best_date, best_url = candidates[0]
-        logging.info("PDF más reciente encontrado: %s (semana %s)", best_url, best_date.isocalendar()[1])
+        week_num = best_date.isocalendar()[1]
+        logging.info("✅ PDF más reciente encontrado: %s (semana %s)", best_url, week_num)
         
         return best_url
 
