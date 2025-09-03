@@ -46,15 +46,14 @@ class Config:
     # Página de listados (Plan B) - URL actualizada
     base_url: str = "https://www.ecdc.europa.eu/en/publications-data/weekly-threat-reports"
 
-    # Plantilla de URL directa ACTUALIZADA (2024)
+    # NUEVO: Plantilla de URL con formato de fecha
     direct_pdf_template: str = (
-        "https://www.ecdc.europa.eu/sites/default/files/documents/"
-        "communicable-disease-threats-report-{year}-w{week}.pdf"
+        "https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-{date}"
     )
 
-    # Patrón de PDF válido ACTUALIZADO (nuevo formato)
+    # NUEVO: Patrón para el formato actual
     pdf_regex: re.Pattern = re.compile(
-        r"/communicable-disease-threats-report-(\d{4})-w(\d+)\.pdf$"
+        r"/communicable-disease-threats-report-(\d{1,2})-([a-z]+)-(\d{4})-week-(\d+)"
     )
 
     # Nº de oraciones del sumario
@@ -109,25 +108,29 @@ class WeeklyReportAgent:
     # ------------------------ Localización del PDF ---------------------
 
     def _try_direct_weekly_pdf(self) -> Optional[str]:
-        """Plan A: URL directa del PDF por semana ISO; retrocede hasta 8 semanas si hace falta."""
+        """Plan A: Intenta encontrar el PDF más reciente basado en fechas."""
         today = dt.date.today()
         year, current_week, _ = today.isocalendar()
         
         logging.info("🔍 Buscando PDF para semana actual: %s-%s", current_week, year)
 
-        # Probar desde la semana actual hasta 8 semanas atrás (más amplio)
-        for weeks_back in range(0, 9):
-            week_to_try = current_week - weeks_back
-            year_to_try = year
-            
-            if week_to_try <= 0:
-                # Ajustar para semanas del año anterior
-                year_to_try = year - 1
-                last_week_prev_year = dt.date(year_to_try, 12, 28).isocalendar()[1]
-                week_to_try = last_week_prev_year + week_to_try
+        # Mapeo de meses en inglés
+        months_en = [
+            'january', 'february', 'march', 'april', 'may', 'june',
+            'july', 'august', 'september', 'october', 'november', 'december'
+        ]
 
-            # Formato actualizado: communicable-disease-threats-report-2024-w35.pdf
-            url = self.config.direct_pdf_template.format(year=year_to_try, week=week_to_try)
+        # Probar desde hoy hasta 35 días atrás (5 semanas)
+        for days_back in range(0, 35):
+            target_date = today - dt.timedelta(days=days_back)
+            year = target_date.year
+            month = months_en[target_date.month - 1]
+            day = target_date.day
+            week_num = current_week - (days_back // 7)
+            
+            # Formato: communicable-disease-threats-report-23-august-2024-week-35
+            url = f"https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-{day}-{month}-{year}-week-{week_num}"
+            
             logging.debug("Probando URL: %s", url)
             
             try:
@@ -137,11 +140,11 @@ class WeeklyReportAgent:
                 content_type = response.headers.get("Content-Type", "").lower()
                 content_length = response.headers.get("Content-Length", "0")
                 
-                # Verificar que sea PDF y tenga tamaño razonable (> 100KB)
+                # Verificar que sea HTML (página) o PDF
                 if (response.status_code == 200 and 
-                    "pdf" in content_type and 
-                    int(content_length) > 100000):  # 100KB mínimo
-                    logging.info("✅ PDF directo encontrado: %s", url)
+                    ("html" in content_type or "pdf" in content_type) and 
+                    int(content_length) > 10000):
+                    logging.info("✅ Enlace encontrado: %s", url)
                     return url
                 else:
                     logging.debug("URL no válida: status=%s, type=%s, size=%s", 
@@ -177,39 +180,48 @@ class WeeklyReportAgent:
             if not href.startswith("http"):
                 href = requests.compat.urljoin(self.config.base_url, href)
 
-            match = self.config.pdf_regex.search(href)
-            if match:
+            # Buscar el nuevo formato en el texto del enlace
+            link_text = link.get_text().lower()
+            if "communicable disease threats report" in link_text and "week" in link_text:
                 found_links += 1
-                week = int(match.group(2))  # Nuevo formato: grupo 2 es la semana
-                year = int(match.group(1))  # Nuevo formato: grupo 1 es el año
+                logging.debug("Encontrado enlace de reporte: %s - %s", href, link_text)
                 
-                logging.debug("Encontrado enlace PDF: %s (semana %s-%s)", href, week, year)
-                
-                # Convertir año/semana a datetime para ordenar correctamente
                 try:
-                    # Primer día de la semana ISO
-                    pdf_date = dt.datetime.fromisocalendar(year, week, 1)
+                    head_response = self.session.head(href, timeout=12, allow_redirects=True)
+                    content_type = head_response.headers.get("Content-Type", "").lower()
                     
-                    try:
-                        head_response = self.session.head(href, timeout=12, allow_redirects=True)
-                        content_type = head_response.headers.get("Content-Type", "").lower()
-                        if head_response.status_code == 200 and "pdf" in content_type:
-                            candidates.append((pdf_date, href))
-                            logging.debug("✅ Candidato válido: %s", href)
-                        else:
-                            logging.debug("❌ Enlace no válido: status=%s, type=%s", head_response.status_code, content_type)
-                    except requests.RequestException as e:
-                        logging.debug("Error verificando enlace %s: %s", href, e)
-                        continue
-                        
-                except ValueError as e:
-                    logging.debug("Error en fecha para %s: %s", href, e)
+                    if head_response.status_code == 200:
+                        # Extraer fecha del texto del enlace
+                        date_match = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", link_text)
+                        if date_match:
+                            day = int(date_match.group(1))
+                            month_str = date_match.group(2)
+                            year = int(date_match.group(3))
+                            
+                            # Convertir mes a número
+                            months = {
+                                'january': 1, 'february': 2, 'march': 3, 'april': 4,
+                                'may': 5, 'june': 6, 'july': 7, 'august': 8,
+                                'september': 9, 'october': 10, 'november': 11, 'december': 12
+                            }
+                            
+                            if month_str in months:
+                                month = months[month_str]
+                                try:
+                                    pdf_date = dt.datetime(year, month, day)
+                                    candidates.append((pdf_date, href))
+                                    logging.debug("✅ Candidato válido: %s", href)
+                                except ValueError:
+                                    logging.debug("Fecha inválida en enlace: %s", href)
+                    
+                except requests.RequestException as e:
+                    logging.debug("Error verificando enlace %s: %s", href, e)
                     continue
 
-        logging.info("📊 Enlaces PDF encontrados: %d totales, %d válidos", found_links, len(candidates))
+        logging.info("📊 Enlaces de reportes encontrados: %d totales, %d válidos", found_links, len(candidates))
 
         if not candidates:
-            logging.info("❌ No se encontraron PDFs válidos en la página")
+            logging.info("❌ No se encontraron reportes válidos en la página")
             return None
 
         # Ordenar por fecha descendente (más reciente primero)
@@ -217,31 +229,31 @@ class WeeklyReportAgent:
         
         # Tomar el más reciente
         best_date, best_url = candidates[0]
-        week_num = best_date.isocalendar()[1]
-        logging.info("✅ PDF más reciente encontrado: %s (semana %s)", best_url, week_num)
+        logging.info("✅ Reporte más reciente encontrado: %s (%s)", best_url, best_date.strftime("%Y-%m-%d"))
         
         return best_url
 
     def _get_pdf_week_info(self, pdf_url: str) -> Optional[Tuple[int, int]]:
-        """Extrae información de semana y año del URL del PDF (nuevo formato)"""
-        match = self.config.pdf_regex.search(pdf_url)
-        if match:
-            year = int(match.group(1))  # Primer grupo: año
-            week = int(match.group(2))  # Segundo grupo: semana
+        """Extrae información de semana del URL del PDF (nuevo formato)"""
+        # Buscar el número de semana en la URL
+        week_match = re.search(r"week-(\d+)", pdf_url)
+        year_match = re.search(r"(\d{4})", pdf_url)
+        
+        if week_match and year_match:
+            week = int(week_match.group(1))
+            year = int(year_match.group(1))
             return (year, week)
         return None
 
     def _try_alternative_urls(self) -> Optional[str]:
         """Método de emergencia: probar URLs alternativas conocidas"""
+        # URL del último reporte conocido (23-29 agosto 2024, week 35)
         alternative_urls = [
-            # Formato antiguo (por si acaso)
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-34-2024.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-33-2024.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-32-2024.pdf",
-            # Formato nuevo
+            "https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-23-29-august-2024-week-35",
+            "https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-16-22-august-2024-week-34",
+            "https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-9-15-august-2024-week-33",
+            # Formato antiguo por si acaso
             "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w34.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w33.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w32.pdf",
         ]
         
         logging.info("🆘 Probando URLs alternativas de emergencia...")
@@ -249,7 +261,7 @@ class WeeklyReportAgent:
         for url in alternative_urls:
             try:
                 response = self.session.head(url, timeout=10, allow_redirects=True)
-                if response.status_code == 200 and "pdf" in response.headers.get("Content-Type", "").lower():
+                if response.status_code == 200:
                     logging.info("✅ URL alternativa funciona: %s", url)
                     return url
             except requests.RequestException:
