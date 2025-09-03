@@ -416,7 +416,11 @@ class WeeklyReportAgent:
 
 
 
-    def run(self) -> None:
+    def run(self) -> None:   
+        import nltk
+        nltk.data.path.append('/home/runner/nltk_data')
+        nltk.data.path.append('$HOME/nltk_data')
+        
         logging.info("🚀 Iniciando agente ECDC")
         
         # Verificar configuración esencial
