@@ -105,16 +105,6 @@ class WeeklyReportAgent:
             ),
             "Accept": "text/html,application/pdf,application/xhtml+xml,*/*;q=0.8",
         })
-        adapter = requests.adapters.HTTPAdapter(
-            max_retries=requests.packages.urllib3.util.retry.Retry(
-                total=4,
-                backoff_factor=0.6,
-                status_forcelist=(429, 500, 502, 503, 504),
-                allowed_methods=frozenset(["HEAD", "GET"]),
-            )
-        )
-        self.session.mount("https://", adapter)
-        self.session.mount("http", adapter)
 
     # ------------------------ Localización del PDF ---------------------
 
@@ -140,21 +130,21 @@ class WeeklyReportAgent:
             logging.debug("Probando URL: %s", url)
             
             try:
-                h = self.session.head(url, timeout=10, allow_redirects=True)
-                logging.debug("Respuesta HEAD: %s - Content-Type: %s", h.status_code, h.headers.get("Content-Type", ""))
+                response = self.session.head(url, timeout=10, allow_redirects=True)
+                logging.debug("Respuesta HEAD: %s - Content-Type: %s", response.status_code, response.headers.get("Content-Type", ""))
                 
-                ct = h.headers.get("Content-Type", "").lower()
-                content_length = h.headers.get("Content-Length", "0")
+                content_type = response.headers.get("Content-Type", "").lower()
+                content_length = response.headers.get("Content-Length", "0")
                 
                 # Verificar que sea PDF y tenga tamaño razonable (> 10KB)
-                if (h.status_code == 200 and 
-                    "pdf" in ct and 
+                if (response.status_code == 200 and 
+                    "pdf" in content_type and 
                     int(content_length) > 10000):
                     logging.info("✅ PDF directo encontrado: semana %s-%s", week_to_try, year_to_try)
                     return url
                 else:
                     logging.debug("URL no válida: status=%s, type=%s, size=%s", 
-                                 h.status_code, ct, content_length)
+                                 response.status_code, content_type, content_length)
                     
             except requests.RequestException as e:
                 logging.debug("Error probando %s: %s", url, e)
@@ -167,30 +157,30 @@ class WeeklyReportAgent:
         """Plan B: rastrea la página de listados y devuelve el PDF más reciente."""
         try:
             logging.info("🌐 Cargando página de listados: %s", self.config.base_url)
-            r = self.session.get(self.config.base_url, timeout=20)
-            r.raise_for_status()
-            logging.debug("Página cargada: %d caracteres", len(r.text))
+            response = self.session.get(self.config.base_url, timeout=20)
+            response.raise_for_status()
+            logging.debug("Página cargada: %d caracteres", len(response.text))
         except requests.RequestException as e:
             logging.warning("No se pudo cargar la página de listados: %s", e)
             return None
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(response.text, "html.parser")
         candidates: List[Tuple[dt.datetime, str]] = []
         found_links = 0
 
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
+        for link in soup.find_all("a", href=True):
+            href = link["href"]
             if not href:
                 continue
                 
             if not href.startswith("http"):
                 href = requests.compat.urljoin(self.config.base_url, href)
 
-            m = self.config.pdf_regex.search(href)
-            if m:
+            match = self.config.pdf_regex.search(href)
+            if match:
                 found_links += 1
-                week = int(m.group(1))
-                year = int(m.group(2))
+                week = int(match.group(1))
+                year = int(match.group(2))
                 
                 logging.debug("Encontrado enlace PDF: %s (semana %s-%s)", href, week, year)
                 
@@ -200,13 +190,13 @@ class WeeklyReportAgent:
                     pdf_date = dt.datetime.fromisocalendar(year, week, 1)
                     
                     try:
-                        h = self.session.head(href, timeout=12, allow_redirects=True)
-                        ct = h.headers.get("Content-Type", "").lower()
-                        if h.status_code == 200 and "pdf" in ct:
+                        head_response = self.session.head(href, timeout=12, allow_redirects=True)
+                        content_type = head_response.headers.get("Content-Type", "").lower()
+                        if head_response.status_code == 200 and "pdf" in content_type:
                             candidates.append((pdf_date, href))
                             logging.debug("✅ Candidato válido: %s", href)
                         else:
-                            logging.debug("❌ Enlace no válido: status=%s, type=%s", h.status_code, ct)
+                            logging.debug("❌ Enlace no válido: status=%s, type=%s", head_response.status_code, content_type)
                     except requests.RequestException as e:
                         logging.debug("Error verificando enlace %s: %s", href, e)
                         continue
@@ -233,10 +223,10 @@ class WeeklyReportAgent:
 
     def _get_pdf_week_info(self, pdf_url: str) -> Optional[Tuple[int, int]]:
         """Extrae información de semana y año del URL del PDF"""
-        m = self.config.pdf_regex.search(pdf_url)
-        if m:
-            week = int(m.group(1))
-            year = int(m.group(2))
+        match = self.config.pdf_regex.search(pdf_url)
+        if match:
+            week = int(match.group(1))
+            year = int(match.group(2))
             return (year, week)
         return None
 
@@ -267,11 +257,11 @@ class WeeklyReportAgent:
 
         # 1) HEAD opcional para tamaño
         try:
-            h = self.session.head(pdf_url, timeout=15, allow_redirects=True)
-            clen = h.headers.get("Content-Length")
-            if clen and int(clen) > max_mb * 1024 * 1024:
+            response = self.session.head(pdf_url, timeout=15, allow_redirects=True)
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > max_mb * 1024 * 1024:
                 raise RuntimeError(
-                    f"El PDF excede {max_mb} MB ({int(clen)/1024/1024:.1f} MB)"
+                    f"El PDF excede {max_mb} MB ({int(content_length)/1024/1024:.1f} MB)"
                 )
         except requests.RequestException:
             pass
@@ -283,10 +273,10 @@ class WeeklyReportAgent:
         }
 
         def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
-            r = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
-            r.raise_for_status()
-            ct = r.headers.get("Content-Type", "")
-            chunk_iter = r.iter_content(chunk_size=8192)
+            response = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            chunk_iter = response.iter_content(chunk_size=8192)
             first = next(chunk_iter, b"")
             with open(dest_path, "wb") as f:
                 if first:
@@ -295,13 +285,13 @@ class WeeklyReportAgent:
                     if not chunk:
                         continue
                     f.write(chunk)
-            return ct, r.headers.get("Content-Length"), first
+            return content_type, response.headers.get("Content-Length"), first
 
         # 2) Primer intento
         try:
-            ct, clen, first = _try_get(pdf_url)
-            logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, ct, clen)
-            if ("pdf" in (ct or "").lower()) and _looks_like_pdf(first):
+            content_type, content_length, first = _try_get(pdf_url)
+            logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, content_type, content_length)
+            if ("pdf" in (content_type or "").lower()) and _looks_like_pdf(first):
                 return
             logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
         except requests.RequestException as e:
@@ -309,14 +299,14 @@ class WeeklyReportAgent:
 
         # 3) Segundo intento con ?download=1
         retry_url = _append_download_param(pdf_url)
-        ct2, clen2, first2 = _try_get(retry_url)
-        logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, ct2, clen2)
-        if ("pdf" in (ct2 or "").lower()) and _looks_like_pdf(first2):
+        content_type2, content_length2, first2 = _try_get(retry_url)
+        logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, content_type2, content_length2)
+        if ("pdf" in (content_type2 or "").lower()) and _looks_like_pdf(first2):
             return
 
         # 4) Error final
         raise RuntimeError(
-            f"No se obtuvo un PDF válido (Content-Type={ct2!r}, firma={first2[:8]!r})."
+            f"No se obtuvo un PDF válido (Content-Type={content_type2!r}, firma={first2[:8]!r})."
         )
 
     def extract_text(self, pdf_path: str) -> str:
@@ -347,8 +337,8 @@ class WeeklyReportAgent:
         sentences = max(1, sentences)
         parser = PlaintextParser.from_string(text, Tokenizer("english"))
         summarizer = LexRankSummarizer()
-        sents = summarizer(parser.document, sentences)
-        return " ".join(str(s) for s in sents)
+        summary_sentences = summarizer(parser.document, sentences)
+        return " ".join(str(sentence) for sentence in summary_sentences)
 
     # ------------------------- Traducción -------------------------------
 
@@ -392,7 +382,6 @@ class WeeklyReportAgent:
         logging.info("📊 DEBUG - ESTADO DEL AGENTE")
         logging.info("=" * 60)
         
-        # 1. Configuración
         logging.info("⚙️ CONFIGURACIÓN:")
         logging.info("   SMTP Server: %s", self.config.smtp_server)
         logging.info("   SMTP Port: %s", self.config.smtp_port)
@@ -400,17 +389,14 @@ class WeeklyReportAgent:
         logging.info("   To: %s", self.config.receiver_email)
         logging.info("   Password configurada: %s", "SÍ" if self.config.email_password else "NO")
         
-        # 2. PDF
         logging.info("📄 PDF:")
         logging.info("   URL encontrada: %s", pdf_url if pdf_url else "NO")
         
-        # 3. Texto
         logging.info("📝 TEXTO:")
         logging.info("   Caracteres extraídos: %d", len(text))
         if len(text) > 100:
             logging.info("   Preview: %s...", text[:100].replace("\n", " "))
         
-        # 4. Resumen
         logging.info("🔍 RESUMEN:")
         logging.info("   Caracteres resumen EN: %d", len(summary_en))
         if summary_en and len(summary_en) > 50:
