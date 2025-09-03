@@ -152,7 +152,7 @@ class WeeklyReportAgent:
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
-        candidates: List[Tuple[int, int, str]] = []
+        candidates: List[Tuple[dt.datetime, str]] = []  # Cambiamos para usar datetime
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -165,17 +165,35 @@ class WeeklyReportAgent:
             if m:
                 week = int(m.group(1))
                 year = int(m.group(2))
+                
+                # Convertir año/semana a datetime para ordenar correctamente
                 try:
-                    h = self.session.head(href, timeout=12, allow_redirects=True)
-                    ct = h.headers.get("Content-Type", "").lower()
-                    if h.status_code == 200 and "pdf" in ct:
-                        candidates.append((year, week, href))
-                        logging.debug("Candidato OK: %s (w=%s, y=%s)", href, week, year)
-                except requests.RequestException:
+                    # Primer día de la semana ISO
+                    pdf_date = dt.datetime.fromisocalendar(year, week, 1)
+                    
+                    try:
+                        h = self.session.head(href, timeout=12, allow_redirects=True)
+                        ct = h.headers.get("Content-Type", "").lower()
+                        if h.status_code == 200 and "pdf" in ct:
+                            candidates.append((pdf_date, href))
+                            logging.debug("Candidato OK: %s (semana %s-%s)", href, week, year)
+                    except requests.RequestException:
+                        continue
+                        
+                except ValueError:
                     continue
 
         if not candidates:
             return None
+
+        # Ordenar por fecha descendente (más reciente primero)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Tomar el más reciente
+        best_date, best_url = candidates[0]
+        logging.info("PDF más reciente encontrado: %s (semana %s)", best_url, best_date.isocalendar()[1])
+        
+        return best_url
 
         candidates.sort(reverse=True)  # por (year, week) desc
         _, _, best = candidates[0]
