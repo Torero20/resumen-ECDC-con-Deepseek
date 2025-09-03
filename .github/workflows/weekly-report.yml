@@ -22,13 +22,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Download NLTK data
+      - name: Download ALL required NLTK data
         run: |
           python -c "
           import nltk
           nltk.download('punkt', download_dir='$HOME/nltk_data')
           nltk.download('stopwords', download_dir='$HOME/nltk_data')
-          print('NLTK data descargado correctamente')
+          nltk.download('punkt_tab', download_dir='$HOME/nltk_data')
+          nltk.download('averaged_perceptron_tagger', download_dir='$HOME/nltk_data')
+          nltk.download('wordnet', download_dir='$HOME/nltk_data')
+          nltk.download('omw-1.4', download_dir='$HOME/nltk_data')
+          print('✅ Todos los datos de NLTK descargados')
           "
 
       - name: Run agent (send email)
