@@ -377,10 +377,52 @@ class WeeklyReportAgent:
                 server.login(self.config.sender_email, self.config.email_password)
             server.send_message(msg)
 
-    # --------------------------- Run -----------------------------------
+    # --------------------------- Debug mejorado -------------------------
+
+    def _debug_logging(self, pdf_url: Optional[str], text: str, summary_en: str, summary_es: str) -> None:
+        """Logging controlado para no saturar los logs"""
+        logging.info("=" * 60)
+        logging.info("📊 DEBUG - ESTADO DEL AGENTE")
+        logging.info("=" * 60)
+        
+        # 1. Configuración
+        logging.info("⚙️ CONFIGURACIÓN:")
+        logging.info("   SMTP Server: %s", self.config.smtp_server)
+        logging.info("   SMTP Port: %s", self.config.smtp_port)
+        logging.info("   From: %s", self.config.sender_email)
+        logging.info("   To: %s", self.config.receiver_email)
+        logging.info("   Password configurada: %s", "SÍ" if self.config.email_password else "NO")
+        
+        # 2. PDF
+        logging.info("📄 PDF:")
+        logging.info("   URL encontrada: %s", pdf_url if pdf_url else "NO")
+        
+        # 3. Texto
+        logging.info("📝 TEXTO:")
+        logging.info("   Caracteres extraídos: %d", len(text))
+        if len(text) > 100:
+            logging.info("   Preview: %s...", text[:100].replace("\n", " "))
+        
+        # 4. Resumen
+        logging.info("🔍 RESUMEN:")
+        logging.info("   Caracteres resumen EN: %d", len(summary_en))
+        if summary_en and len(summary_en) > 50:
+            logging.info("   Preview EN: %s...", summary_en[:50])
+        logging.info("   Caracteres resumen ES: %d", len(summary_es))
+        if summary_es and len(summary_es) > 50:
+            logging.info("   Preview ES: %s...", summary_es[:50])
+        
+        logging.info("=" * 60)
+
+
 
     def run(self) -> None:
         logging.info("🚀 Iniciando agente ECDC")
+        
+        # Verificar configuración esencial
+        if not all([self.config.smtp_server, self.config.sender_email, self.config.receiver_email]):
+            logging.error("❌ CONFIGURACIÓN FALTANTE: Revisa SMTP_SERVER, SENDER_EMAIL, RECEIVER_EMAIL")
+            return
         
         # Lee SUMMARY_SENTENCES si está
         ss_env = os.getenv("SUMMARY_SENTENCES")
@@ -400,23 +442,29 @@ class WeeklyReportAgent:
 
         tmp_path = ""
         text = ""
+        summary_en = ""
+        summary_es = ""
+        
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp_path = tmp.name
 
             # Descargar
             try:
+                logging.info("⬇️ Descargando PDF...")
                 self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
+                logging.info("✅ PDF descargado")
             except Exception as e:
-                logging.exception("Fallo descargando el PDF: %s", e)
+                logging.error("❌ Fallo descargando el PDF: %s", e)
                 return
 
             # Extraer
             try:
+                logging.info("📖 Extrayendo texto...")
                 text = self.extract_text(tmp_path) or ""
-                logging.info("Texto extraído: %d caracteres", len(text))
+                logging.info("✅ Texto extraído: %d caracteres", len(text))
             except Exception as e:
-                logging.exception("Fallo extrayendo texto: %s", e)
+                logging.error("❌ Fallo extrayendo texto: %s", e)
                 text = ""
         finally:
             if tmp_path:
@@ -428,43 +476,57 @@ class WeeklyReportAgent:
                         time.sleep(0.2)
 
         if not text.strip():
-            logging.warning("El PDF no contiene texto extraíble.")
+            logging.warning("⚠️ El PDF no contiene texto extraíble.")
+            # Debug incluso si falla
+            self._debug_logging(pdf_url, text, "", "")
             return
 
         # Resumen
         try:
+            logging.info("🧠 Generando resumen...")
             summary_en = self.summarize(text, self.config.summary_sentences)
-            logging.info("Resumen generado: %d caracteres", len(summary_en))
+            logging.info("✅ Resumen generado: %d caracteres", len(summary_en))
         except Exception as e:
-            logging.exception("Fallo generando el resumen: %s", e)
+            logging.error("❌ Fallo generando el resumen: %s", e)
             return
+
         if not summary_en.strip():
-            logging.warning("No se pudo generar resumen.")
+            logging.warning("⚠️ No se pudo generar resumen.")
+            self._debug_logging(pdf_url, text, "", "")
             return
 
         # Traducción
         try:
+            logging.info("🌍 Traduciendo...")
             summary_es = self.translate_to_spanish(summary_en)
-            logging.info("Traducción completada: %d caracteres", len(summary_es))
+            logging.info("✅ Traducción completada: %d caracteres", len(summary_es))
         except Exception as e:
-            logging.exception("Fallo traduciendo, envío el original en inglés: %s", e)
+            logging.warning("⚠️ Fallo traduciendo, uso original: %s", e)
             summary_es = summary_en
+
+        # Mostrar debug controlado
+        self._debug_logging(pdf_url, text, summary_en, summary_es)
 
         html = self.build_html(summary_es, pdf_url)
         subject = "Resumen del informe semanal del ECDC"
 
         if self.config.dry_run:
-            logging.info("DRY_RUN=1: no se envía email. Asunto: %s", subject)
-            logging.debug("Resumen ES:\n%s", summary_es)
+            logging.info("🔶 DRY_RUN=1: No se envía email. Asunto: %s", subject)
             return
 
         # Envío
         try:
+            logging.info("📧 Enviando email...")
             self.send_email(subject, summary_es, html)
             logging.info("✅ Correo enviado correctamente.")
             self._save_processed_url(pdf_url)
         except Exception as e:
-            logging.exception("❌ Fallo enviando el email: %s", e)
+            logging.error("❌ Fallo enviando el email: %s", e)
+            # Info adicional para errores de SMTP
+            if "authentication" in str(e).lower():
+                logging.error("💡 POSIBLE SOLUCIÓN: Revisa la contraseña de aplicación de Gmail")
+            elif "connection" in str(e).lower():
+                logging.error("💡 POSIBLE SOLUCIÓN: Revisa SMTP_SERVER y SMTP_PORT")
 
 # ---------------------------------------------------------------------
 # main
