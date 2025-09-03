@@ -22,6 +22,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Reset state (forzar nueva búsqueda)
+        run: rm -f .agent_state.json
+        
       - name: Download NLTK data
         run: |
           python -c "
