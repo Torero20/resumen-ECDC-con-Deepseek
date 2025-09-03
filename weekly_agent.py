@@ -119,29 +119,51 @@ class WeeklyReportAgent:
     # ------------------------ Localización del PDF ---------------------
 
     def _try_direct_weekly_pdf(self) -> Optional[str]:
-        """Plan A: URL directa del PDF por semana ISO; retrocede hasta 6 semanas si hace falta."""
+        """Plan A: URL directa del PDF por semana ISO; retrocede hasta 4 semanas si hace falta."""
         today = dt.date.today()
-        year, week, _ = today.isocalendar()
+        year, current_week, _ = today.isocalendar()
 
-        for delta in range(0, 7):
-            w = week - delta
-            y = year
-            if w <= 0:
-                y = year - 1
-                last_week_prev_year = dt.date(y, 12, 28).isocalendar()[1]
-                w = last_week_prev_year + w
+        # Probar desde la semana actual hasta 4 semanas atrás
+        for weeks_back in range(0, 5):
+            week_to_try = current_week - weeks_back
+            year_to_try = year
+            
+            if week_to_try <= 0:
+                # Ajustar para semanas del año anterior
+                year_to_try = year - 1
+                last_week_prev_year = dt.date(year_to_try, 12, 28).isocalendar()[1]
+                week_to_try = last_week_prev_year + week_to_try  # week_to_try es negativo
 
-            url = self.config.direct_pdf_template.format(week=w, year=y)
+            url = self.config.direct_pdf_template.format(week=week_to_try, year=year_to_try)
             try:
-                h = self.session.head(url, timeout=12, allow_redirects=True)
-                logging.debug("HEAD %s -> %s", url, h.status_code)
+                h = self.session.head(url, timeout=10, allow_redirects=True)
+                logging.debug("Probando semana %s-%s: %s -> %s", week_to_try, year_to_try, url, h.status_code)
+                
                 ct = h.headers.get("Content-Type", "").lower()
-                if h.status_code == 200 and "pdf" in ct:
+                content_length = h.headers.get("Content-Length", "0")
+                
+                # Verificar que sea PDF y tenga tamaño razonable (> 10KB)
+                if (h.status_code == 200 and 
+                    "pdf" in ct and 
+                    int(content_length) > 10000):
+                    logging.info("✅ PDF directo encontrado: semana %s-%s", week_to_try, year_to_try)
                     return url
-            except requests.RequestException:
+                    
+            except requests.RequestException as e:
+                logging.debug("Error probando %s: %s", url, e)
                 continue
+                
         return None
 
+        def _get_pdf_week_info(self, pdf_url: str) -> Optional[Tuple[int, int]]:
+        """Extrae información de semana y año del URL del PDF"""
+        m = self.config.pdf_regex.search(pdf_url)
+        if m:
+            week = int(m.group(1))
+            year = int(m.group(2))
+            return (year, week)
+        return None
+        
     def _scan_listing_page(self) -> Optional[str]:
         """Plan B: rastrea la página de listados y devuelve el PDF más reciente."""
         try:
@@ -451,10 +473,29 @@ class WeeklyReportAgent:
         if ss_env and ss_env.strip().isdigit():
             self.config.summary_sentences = int(ss_env.strip())
 
+           def run(self) -> None:
+        # ... código existente al principio ...
+        
         pdf_url = self.fetch_latest_pdf_url()
         if not pdf_url:
             logging.info("No hay PDF nuevo o no se encontró ninguno.")
             return
+
+        # Verificar información del PDF encontrado
+        pdf_info = self._get_pdf_week_info(pdf_url)
+        if pdf_info:
+            year, week = pdf_info
+            current_year, current_week, _ = dt.date.today().isocalendar()
+            logging.info("📅 PDF encontrado: semana %s del año %s", week, year)
+            logging.info("📅 Semana actual: semana %s del año %s", current_week, current_year)
+            
+            # Verificar si es de la semana actual o anterior
+            if year == current_year and week == current_week:
+                logging.info("✅ PDF de la semana actual")
+            elif year == current_year and week == current_week - 1:
+                logging.info("ℹ️ PDF de la semana pasada")
+            else:
+                logging.warning("⚠️ PDF puede estar desactualizado")
 
         # Verificar si ya procesamos este URL
         last_url = self._get_last_processed_url()
