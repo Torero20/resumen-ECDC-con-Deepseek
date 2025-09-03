@@ -35,14 +35,42 @@ jobs:
           print('✅ Todos los datos de NLTK descargados')
           "
 
-      - name: Run agent (DEBUG completo)
+      - name: Debug - Test PDF URLs manually
+        run: |
+          echo "=== 🔍 TEST MANUAL DE URLs PDF ==="
+          echo "Probando semana 35-2024:"
+          curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-35-2024.pdf" | head -5
+          echo ""
+          echo "Probando semana 34-2024:"
+          curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-34-2024.pdf" | head -5
+          echo ""
+          echo "Probando semana 33-2024:"
+          curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-33-2024.pdf" | head -5
+          echo "=== FIN TEST ==="
+
+      - name: Debug - Check listing page content
+        run: |
+          echo "=== 🔍 CONTENIDO DE LA PÁGINA DE LISTADOS ==="
+          curl -s "https://www.ecdc.europa.eu/en/publications-and-data/monitoring/weekly-threats-reports" | grep -o 'https://[^"]*\.pdf' | head -10 || echo "No se encontraron PDFs en la página"
+          echo "=== FIN CONTENIDO ==="
+
+      - name: Run agent (DEBUG mode)
         env:
-            LOG_LEVEL: DEBUG  # ← Cambiar a DEBUG
-            SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-            SMTP_PORT: ${{ secrets.SMTP_PORT }}
-            SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-            RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-            EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-       run: |
-           echo "=== BÚSQUEDA DE PDF - MODO DEBUG ==="
-       python weekly_agent.py
+          LOG_LEVEL: DEBUG  # Modo DEBUG para ver detalles
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python weekly_agent.py
+
+      - name: Show final status
+        if: always()
+        run: |
+          echo "=== 📊 ESTADO FINAL ==="
+          echo "Workflow completado - Revisa los logs anteriores para detalles"
+          echo "Si no se encontró PDF, puede que:"
+          echo "1. El ECDC no haya publicado el informe aún"
+          echo "2. La URL del PDF haya cambiado"
+          echo "3. Necesitemos ajustar la búsqueda"
+          echo "==="
