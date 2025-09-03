@@ -114,7 +114,7 @@ class WeeklyReportAgent:
             )
         )
         self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        self.session.mount("http", adapter)
 
     # ------------------------ Localización del PDF ---------------------
 
@@ -132,7 +132,7 @@ class WeeklyReportAgent:
                 # Ajustar para semanas del año anterior
                 year_to_try = year - 1
                 last_week_prev_year = dt.date(year_to_try, 12, 28).isocalendar()[1]
-                week_to_try = last_week_prev_year + week_to_try  # week_to_try es negativo
+                week_to_try = last_week_prev_year + week_to_try
 
             url = self.config.direct_pdf_template.format(week=week_to_try, year=year_to_try)
             try:
@@ -155,15 +155,6 @@ class WeeklyReportAgent:
                 
         return None
 
-        def _get_pdf_week_info(self, pdf_url: str) -> Optional[Tuple[int, int]]:
-        """Extrae información de semana y año del URL del PDF"""
-        m = self.config.pdf_regex.search(pdf_url)
-        if m:
-            week = int(m.group(1))
-            year = int(m.group(2))
-            return (year, week)
-        return None
-        
     def _scan_listing_page(self) -> Optional[str]:
         """Plan B: rastrea la página de listados y devuelve el PDF más reciente."""
         try:
@@ -174,7 +165,7 @@ class WeeklyReportAgent:
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
-        candidates: List[Tuple[dt.datetime, str]] = []  # Cambiamos para usar datetime
+        candidates: List[Tuple[dt.datetime, str]] = []
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
@@ -217,9 +208,14 @@ class WeeklyReportAgent:
         
         return best_url
 
-        candidates.sort(reverse=True)  # por (year, week) desc
-        _, _, best = candidates[0]
-        return best
+    def _get_pdf_week_info(self, pdf_url: str) -> Optional[Tuple[int, int]]:
+        """Extrae información de semana y año del URL del PDF"""
+        m = self.config.pdf_regex.search(pdf_url)
+        if m:
+            week = int(m.group(1))
+            year = int(m.group(2))
+            return (year, week)
+        return None
 
     def fetch_latest_pdf_url(self) -> Optional[str]:
         """Intenta Plan A; si falla, Plan B."""
@@ -365,6 +361,43 @@ class WeeklyReportAgent:
         except Exception:
             pass
 
+    # ------------------------- Debug mejorado ---------------------------
+
+    def _debug_logging(self, pdf_url: Optional[str], text: str, summary_en: str, summary_es: str) -> None:
+        """Logging controlado para no saturar los logs"""
+        logging.info("=" * 60)
+        logging.info("📊 DEBUG - ESTADO DEL AGENTE")
+        logging.info("=" * 60)
+        
+        # 1. Configuración
+        logging.info("⚙️ CONFIGURACIÓN:")
+        logging.info("   SMTP Server: %s", self.config.smtp_server)
+        logging.info("   SMTP Port: %s", self.config.smtp_port)
+        logging.info("   From: %s", self.config.sender_email)
+        logging.info("   To: %s", self.config.receiver_email)
+        logging.info("   Password configurada: %s", "SÍ" if self.config.email_password else "NO")
+        
+        # 2. PDF
+        logging.info("📄 PDF:")
+        logging.info("   URL encontrada: %s", pdf_url if pdf_url else "NO")
+        
+        # 3. Texto
+        logging.info("📝 TEXTO:")
+        logging.info("   Caracteres extraídos: %d", len(text))
+        if len(text) > 100:
+            logging.info("   Preview: %s...", text[:100].replace("\n", " "))
+        
+        # 4. Resumen
+        logging.info("🔍 RESUMEN:")
+        logging.info("   Caracteres resumen EN: %d", len(summary_en))
+        if summary_en and len(summary_en) > 50:
+            logging.info("   Preview EN: %s...", summary_en[:50])
+        logging.info("   Caracteres resumen ES: %d", len(summary_es))
+        if summary_es and len(summary_es) > 50:
+            logging.info("   Preview ES: %s...", summary_es[:50])
+        
+        logging.info("=" * 60)
+
     # ------------------------- Email -----------------------------------
 
     def build_html(self, summary_es: str, pdf_url: str) -> str:
@@ -417,46 +450,10 @@ class WeeklyReportAgent:
                 server.login(self.config.sender_email, self.config.email_password)
             server.send_message(msg)
 
-    # --------------------------- Debug mejorado -------------------------
+    # --------------------------- Run -----------------------------------
 
-    def _debug_logging(self, pdf_url: Optional[str], text: str, summary_en: str, summary_es: str) -> None:
-        """Logging controlado para no saturar los logs"""
-        logging.info("=" * 60)
-        logging.info("📊 DEBUG - ESTADO DEL AGENTE")
-        logging.info("=" * 60)
-        
-        # 1. Configuración
-        logging.info("⚙️ CONFIGURACIÓN:")
-        logging.info("   SMTP Server: %s", self.config.smtp_server)
-        logging.info("   SMTP Port: %s", self.config.smtp_port)
-        logging.info("   From: %s", self.config.sender_email)
-        logging.info("   To: %s", self.config.receiver_email)
-        logging.info("   Password configurada: %s", "SÍ" if self.config.email_password else "NO")
-        
-        # 2. PDF
-        logging.info("📄 PDF:")
-        logging.info("   URL encontrada: %s", pdf_url if pdf_url else "NO")
-        
-        # 3. Texto
-        logging.info("📝 TEXTO:")
-        logging.info("   Caracteres extraídos: %d", len(text))
-        if len(text) > 100:
-            logging.info("   Preview: %s...", text[:100].replace("\n", " "))
-        
-        # 4. Resumen
-        logging.info("🔍 RESUMEN:")
-        logging.info("   Caracteres resumen EN: %d", len(summary_en))
-        if summary_en and len(summary_en) > 50:
-            logging.info("   Preview EN: %s...", summary_en[:50])
-        logging.info("   Caracteres resumen ES: %d", len(summary_es))
-        if summary_es and len(summary_es) > 50:
-            logging.info("   Preview ES: %s...", summary_es[:50])
-        
-        logging.info("=" * 60)
-
-
-
-    def run(self) -> None:   
+    def run(self) -> None:
+        # Configuración de NLTK
         import nltk
         nltk.data.path.append('/home/runner/nltk_data')
         nltk.data.path.append('$HOME/nltk_data')
@@ -473,9 +470,6 @@ class WeeklyReportAgent:
         if ss_env and ss_env.strip().isdigit():
             self.config.summary_sentences = int(ss_env.strip())
 
-           def run(self) -> None:
-        # ... código existente al principio ...
-        
         pdf_url = self.fetch_latest_pdf_url()
         if not pdf_url:
             logging.info("No hay PDF nuevo o no se encontró ninguno.")
@@ -540,7 +534,6 @@ class WeeklyReportAgent:
 
         if not text.strip():
             logging.warning("⚠️ El PDF no contiene texto extraíble.")
-            # Debug incluso si falla
             self._debug_logging(pdf_url, text, "", "")
             return
 
@@ -585,7 +578,6 @@ class WeeklyReportAgent:
             self._save_processed_url(pdf_url)
         except Exception as e:
             logging.error("❌ Fallo enviando el email: %s", e)
-            # Info adicional para errores de SMTP
             if "authentication" in str(e).lower():
                 logging.error("💡 POSIBLE SOLUCIÓN: Revisa la contraseña de aplicación de Gmail")
             elif "connection" in str(e).lower():
