@@ -43,17 +43,18 @@ except Exception:
 
 @dataclass
 class Config:
-    # Página de listados (Plan B) - URL actualizada
-    base_url: str = "https://www.ecdc.europa.eu/en/publications-data/weekly-threat-reports"
+    # Página de listados CORREGIDA (2024)
+    base_url: str = "https://www.ecdc.europa.eu/en/publications-data/weekly-threat-reports-archive"
 
-    # NUEVO: Plantilla de URL con formato de fecha
+    # Plantilla de URL CORREGIDA (2024)
     direct_pdf_template: str = (
-        "https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-{date}"
+        "https://www.ecdc.europa.eu/sites/default/files/documents/"
+        "communicable-disease-threats-report-{year}-w{week:02d}.pdf"
     )
 
-    # NUEVO: Patrón para el formato actual
+    # Patrón de PDF CORREGIDO
     pdf_regex: re.Pattern = re.compile(
-        r"/communicable-disease-threats-report-(\d{1,2})-([a-z]+)-(\d{4})-week-(\d+)"
+        r"/communicable-disease-threats-report-(\d{4})-w(\d{2})\.pdf$"
     )
 
     # Nº de oraciones del sumario
@@ -107,18 +108,51 @@ class WeeklyReportAgent:
 
     # ------------------------ Localización del PDF ---------------------
 
-    def _try_direct_weekly_pdf(self) -> Optional[str]:
-        """Plan A: Intenta encontrar el PDF más reciente basado en fechas."""
+      def _try_direct_weekly_pdf(self) -> Optional[str]:
+        """Plan A: URL directa del PDF por semana ISO; formato 2024-w35.pdf"""
         today = dt.date.today()
-        year, current_week, _ = today.isocalendar()
+        current_year, current_week, _ = today.isocalendar()
         
-        logging.info("🔍 Buscando PDF para semana actual: %s-%s", current_week, year)
+        logging.info("🔍 Buscando PDF para semana actual: %s-%s", current_week, current_year)
 
-        # Mapeo de meses en inglés
-        months_en = [
-            'january', 'february', 'march', 'april', 'may', 'june',
-            'july', 'august', 'september', 'october', 'november', 'december'
-        ]
+        # Probar desde la semana actual hasta 8 semanas atrás
+        for weeks_back in range(0, 9):
+            week_to_try = current_week - weeks_back
+            year_to_try = current_year
+            
+            if week_to_try <= 0:
+                # Ajustar para semanas del año anterior
+                year_to_try = current_year - 1
+                last_week_prev_year = dt.date(year_to_try, 12, 28).isocalendar()[1]
+                week_to_try = last_week_prev_year + week_to_try
+
+            # Formato 2024: communicable-disease-threats-report-2024-w35.pdf
+            url = self.config.direct_pdf_template.format(year=year_to_try, week=week_to_try)
+            logging.debug("Probando URL: %s", url)
+            
+            try:
+                response = self.session.head(url, timeout=10, allow_redirects=True)
+                logging.debug("Respuesta HEAD: %s - Content-Type: %s", response.status_code, response.headers.get("Content-Type", ""))
+                
+                content_type = response.headers.get("Content-Type", "").lower()
+                content_length = response.headers.get("Content-Length", "0")
+                
+                # Verificar que sea PDF y tenga tamaño razonable (> 100KB)
+                if (response.status_code == 200 and 
+                    "pdf" in content_type and 
+                    int(content_length) > 100000):
+                    logging.info("✅ PDF directo encontrado: %s", url)
+                    return url
+                else:
+                    logging.debug("URL no válida: status=%s, type=%s, size=%s", 
+                                 response.status_code, content_type, content_length)
+                    
+            except requests.RequestException as e:
+                logging.debug("Error probando %s: %s", url, e)
+                continue
+                
+        logging.info("❌ No se encontró PDF por URL directa")
+        return None
 
         # Probar desde hoy hasta 35 días atrás (5 semanas)
         for days_back in range(0, 35):
@@ -245,15 +279,18 @@ class WeeklyReportAgent:
             return (year, week)
         return None
 
-    def _try_alternative_urls(self) -> Optional[str]:
-        """Método de emergencia: probar URLs alternativas conocidas"""
-        # URL del último reporte conocido (23-29 agosto 2024, week 35)
+        def _try_alternative_urls(self) -> Optional[str]:
+        """Método de emergencia: probar URLs alternativas conocidas para 2024"""
         alternative_urls = [
-            "https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-23-29-august-2024-week-35",
-            "https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-16-22-august-2024-week-34",
-            "https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-9-15-august-2024-week-33",
-            # Formato antiguo por si acaso
+            # Formato 2024 (semana 35)
+            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w35.pdf",
             "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w34.pdf",
+            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w33.pdf",
+            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w32.pdf",
+            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w31.pdf",
+            # Formato antiguo por si acaso
+            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-35-2024.pdf",
+            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-34-2024.pdf",
         ]
         
         logging.info("🆘 Probando URLs alternativas de emergencia...")
@@ -261,9 +298,18 @@ class WeeklyReportAgent:
         for url in alternative_urls:
             try:
                 response = self.session.head(url, timeout=10, allow_redirects=True)
-                if response.status_code == 200:
+                content_type = response.headers.get("Content-Type", "").lower()
+                if response.status_code == 200 and "pdf" in content_type:
                     logging.info("✅ URL alternativa funciona: %s", url)
                     return url
+                else:
+                    logging.debug("URL alternativa no válida: %s (status=%s)", url, response.status_code)
+            except requests.RequestException as e:
+                logging.debug("Error probando alternativa %s: %s", url, e)
+                continue
+                
+        logging.info("❌ Ninguna URL alternativa funcionó")
+        return None
             except requests.RequestException:
                 continue
                 
