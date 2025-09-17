@@ -34,12 +34,24 @@ jobs:
           print('NLTK data descargado correctamente')
           "
 
-      - name: Run agent (send email)
-        env:
-          LOG_LEVEL: DEBUG
-          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        run: python weekly_agent.py
+     - name: Test URLs manualmente
+      run: |
+        echo "=== 🔍 TEST MANUAL DE URLs ==="
+        echo "Probando formato 2024:"
+        curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w35.pdf" | head -3
+        echo ""
+        curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w34.pdf" | head -3
+        echo ""
+        echo "Probando formato antiguo:"
+        curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-35-2024.pdf" | head -3
+        echo "=== FIN TEST ==="
+
+- name: Run agent (DEBUG mode)
+  env:
+    LOG_LEVEL: DEBUG
+    SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+    SMTP_PORT: ${{ secrets.SMTP_PORT }}
+    SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+    RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+    EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+  run: python weekly_agent.py
