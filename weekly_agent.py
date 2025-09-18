@@ -1,697 +1,649 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
-
 import os
 import re
 import ssl
-import smtplib
-import time
-import logging
 import json
-import tempfile
+import smtplib
+import logging
 import datetime as dt
-from dataclasses import dataclass
-from email.message import EmailMessage
-from typing import Optional, List, Tuple
-
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, unquote
 
-# PDF: preferimos pdfplumber; si falla, hacemos fallback a pdfminer
-import pdfplumber
-try:
-    from pdfminer.high_level import extract_text as pm_extract
-except Exception:
-    pm_extract = None
-
-# Sumario extractivo (no requiere NLTK si usamos el tokenizer de sumy)
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.lex_rank import LexRankSummarizer
-
-# Traducción mejorada
-try:
-    from deep_translator import GoogleTranslator
-except Exception:
-    GoogleTranslator = None
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 # ---------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------
 
-@dataclass
 class Config:
-    # Página de listados CORREGIDA (2024)
-    base_url: str = "https://www.ecdc.europa.eu/en/publications-data/weekly-threat-reports-archive"
+    list_url = "https://www.ecdc.europa.eu/en/publications-and-data/monitoring/weekly-threats-reports"
 
-    # Plantilla de URL CORREGIDA (2024)
-    direct_pdf_template: str = (
-        "https://www.ecdc.europa.eu/sites/default/files/documents/"
-        "communicable-disease-threats-report-{year}-w{week:02d}.pdf"
+    smtp_server = os.getenv("SMTP_SERVER", "")
+    smtp_port = int(os.getenv("SMTP_PORT", "465") or "465")  # 465 SSL; 587 STARTTLS
+    sender_email = os.getenv("SENDER_EMAIL", "")
+    email_password = os.getenv("EMAIL_PASSWORD", "")
+    receiver_email = os.getenv(
+        "RECEIVER_EMAIL",
+        "miralles.paco@gmail.com, contra1270@gmail.com, mirallesf@vithas.es"
     )
 
-    # Patrón de PDF CORREGIDO
-    pdf_regex: re.Pattern = re.compile(
-        r"/communicable-disease-threats-report-(\d{4})-w(\d{2})\.pdf$"
-    )
+    dry_run = os.getenv("DRY_RUN", "0") == "1"
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    state_file = ".weekly_agent_state.json"
 
-    # Nº de oraciones del sumario
-    summary_sentences: int = 12
 
-    # SMTP/Email (rellenado vía GitHub Secrets en el workflow)
-    smtp_server: str = os.getenv("SMTP_SERVER", "")
-    smtp_port: int = int(os.getenv("SMTP_PORT", "465") or "465")
-    sender_email: str = os.getenv("SENDER_EMAIL", "")
-    receiver_email: str = os.getenv("RECEIVER_EMAIL", "")
-    email_password: str = os.getenv("EMAIL_PASSWORD", "")
+# ---------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------
 
-    # Bandera para no enviar correo (tests): DRY_RUN=1
-    dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
+MESES_ES = {
+    1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
+    7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
+}
 
-    # Log level
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
+def fecha_es(dt_utc: dt.datetime) -> str:
+    return f"{dt_utc.day} de {MESES_ES.get(dt_utc.month, 'mes')} de {dt_utc.year} (UTC)"
 
-    # Tamaño máximo opcional (MB) para abortar PDFs inusualmente grandes
-    max_pdf_mb: int = 25
 
 # ---------------------------------------------------------------------
 # Agente
 # ---------------------------------------------------------------------
 
 class WeeklyReportAgent:
-    """
-    Pipeline:
-      1) Intenta localizar el PDF de la semana actual (Plan A: URL directa).
-      2) Si falla, rastrea la página de listados y localiza el PDF más reciente (Plan B).
-      3) Descarga, extrae texto, resume (LexRank), traduce al español y envía email.
-    """
-
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config):
         self.config = config
-
         logging.basicConfig(
             level=getattr(logging, self.config.log_level.upper(), logging.INFO),
-            format="%(levelname)s %(message)s"
+            format="%(asctime)s %(levelname)s %(message)s"
         )
-
-        # Sesión HTTP con reintentos
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/pdf,application/xhtml+xml,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
         })
 
-    # ------------------------ Localización del PDF ---------------------
+    # ------------------ Localización PDF ------------------
 
-      def _try_direct_weekly_pdf(self) -> Optional[str]:
-        """Plan A: URL directa del PDF por semana ISO; formato 2024-w35.pdf"""
-        today = dt.date.today()
-        current_year, current_week, _ = today.isocalendar()
-        
-        logging.info("🔍 Buscando PDF para semana actual: %s-%s", current_week, current_year)
+    def _parse_week_year(self, text: str):
+        s = unquote(text or "").lower()
+        w = re.search(r"\bweek[\s\-]?(\d{1,2})\b", s)
+        y = re.search(r"\b(20\d{2})\b", s)
+        return (int(w.group(1)) if w else None,
+                int(y.group(1)) if y else None)
 
-        # Probar desde la semana actual hasta 8 semanas atrás
-        for weeks_back in range(0, 9):
-            week_to_try = current_week - weeks_back
-            year_to_try = current_year
-            
-            if week_to_try <= 0:
-                # Ajustar para semanas del año anterior
-                year_to_try = current_year - 1
-                last_week_prev_year = dt.date(year_to_try, 12, 28).isocalendar()[1]
-                week_to_try = last_week_prev_year + week_to_try
+    def fetch_latest_pdf(self):
+        r = self.session.get(self.config.list_url, timeout=30)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
 
-            # Formato 2024: communicable-disease-threats-report-2024-w35.pdf
-            url = self.config.direct_pdf_template.format(year=year_to_try, week=week_to_try)
-            logging.debug("Probando URL: %s", url)
-            
-            try:
-                response = self.session.head(url, timeout=10, allow_redirects=True)
-                logging.debug("Respuesta HEAD: %s - Content-Type: %s", response.status_code, response.headers.get("Content-Type", ""))
-                
-                content_type = response.headers.get("Content-Type", "").lower()
-                content_length = response.headers.get("Content-Length", "0")
-                
-                # Verificar que sea PDF y tenga tamaño razonable (> 100KB)
-                if (response.status_code == 200 and 
-                    "pdf" in content_type and 
-                    int(content_length) > 100000):
-                    logging.info("✅ PDF directo encontrado: %s", url)
-                    return url
-                else:
-                    logging.debug("URL no válida: status=%s, type=%s, size=%s", 
-                                 response.status_code, content_type, content_length)
-                    
-            except requests.RequestException as e:
-                logging.debug("Error probando %s: %s", url, e)
+        candidates = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            l = href.lower()
+            if "communicable-disease-threats-report" in l and ("/publications-data/" in l or "/publications-and-data/" in l):
+                url = href if href.startswith("http") else urljoin("https://www.ecdc.europa.eu", href)
+                candidates.append(url)
+
+        seen, ordered = set(), []
+        for u in candidates:
+            if u not in seen:
+                ordered.append(u)
+                seen.add(u)
+
+        if not ordered:
+            raise RuntimeError("No se encontraron artículos CDTR.")
+
+        for article_url in ordered:
+            ar = self.session.get(article_url, timeout=30)
+            if ar.status_code != 200:
                 continue
-                
-        logging.info("❌ No se encontró PDF por URL directa")
-        return None
-
-        # Probar desde hoy hasta 35 días atrás (5 semanas)
-        for days_back in range(0, 35):
-            target_date = today - dt.timedelta(days=days_back)
-            year = target_date.year
-            month = months_en[target_date.month - 1]
-            day = target_date.day
-            week_num = current_week - (days_back // 7)
-            
-            # Formato: communicable-disease-threats-report-23-august-2024-week-35
-            url = f"https://www.ecdc.europa.eu/en/publications-data/communicable-disease-threats-report-{day}-{month}-{year}-week-{week_num}"
-            
-            logging.debug("Probando URL: %s", url)
-            
-            try:
-                response = self.session.head(url, timeout=10, allow_redirects=True)
-                logging.debug("Respuesta HEAD: %s - Content-Type: %s", response.status_code, response.headers.get("Content-Type", ""))
-                
-                content_type = response.headers.get("Content-Type", "").lower()
-                content_length = response.headers.get("Content-Length", "0")
-                
-                # Verificar que sea HTML (página) o PDF
-                if (response.status_code == 200 and 
-                    ("html" in content_type or "pdf" in content_type) and 
-                    int(content_length) > 10000):
-                    logging.info("✅ Enlace encontrado: %s", url)
-                    return url
-                else:
-                    logging.debug("URL no válida: status=%s, type=%s, size=%s", 
-                                 response.status_code, content_type, content_length)
-                    
-            except requests.RequestException as e:
-                logging.debug("Error probando %s: %s", url, e)
+            asoup = BeautifulSoup(ar.text, "html.parser")
+            pdf_a = asoup.find("a", href=re.compile(r"\.pdf$", re.I))
+            if not pdf_a:
                 continue
-                
-        logging.info("❌ No se encontró PDF por URL directa")
-        return None
+            pdf_url = pdf_a["href"]
+            if not pdf_url.startswith("http"):
+                pdf_url = urljoin(article_url, pdf_url)
+            t = (asoup.title.get_text(strip=True) if asoup.title else "") + " " + pdf_url
+            week, year = self._parse_week_year(t)
+            logging.info("PDF más reciente: %s (semana=%s, año=%s)", pdf_url, week, year)
+            return pdf_url, article_url, week, year
 
-    def _scan_listing_page(self) -> Optional[str]:
-        """Plan B: rastrea la página de listados y devuelve el PDF más reciente."""
+        raise RuntimeError("No se encontró PDF en los artículos candidatos.")
+
+    # ------------------ Estado (anti-duplicados) ------------------
+
+    def _load_last_state(self):
+        if not os.path.exists(self.config.state_file):
+            return {}
         try:
-            logging.info("🌐 Cargando página de listados: %s", self.config.base_url)
-            response = self.session.get(self.config.base_url, timeout=20)
-            response.raise_for_status()
-            logging.debug("Página cargada: %d caracteres", len(response.text))
-        except requests.RequestException as e:
-            logging.warning("No se pudo cargar la página de listados: %s", e)
-            return None
+            with open(self.config.state_file, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        candidates: List[Tuple[dt.datetime, str]] = []
-        found_links = 0
+    def _save_last_state(self, pdf_url):
+        state = {"last_pdf_url": pdf_url, "timestamp": dt.datetime.utcnow().isoformat()}
+        with open(self.config.state_file, "w") as f:
+            json.dump(state, f)
 
-        for link in soup.find_all("a", href=True):
-            href = link["href"]
-            if not href:
-                continue
-                
-            if not href.startswith("http"):
-                href = requests.compat.urljoin(self.config.base_url, href)
+    # ------------------ HTML email-safe (sin imágenes, con “círculos” CSS) ------------------
 
-            # Buscar el nuevo formato en el texto del enlace
-            link_text = link.get_text().lower()
-            if "communicable disease threats report" in link_text and "week" in link_text:
-                found_links += 1
-                logging.debug("Encontrado enlace de reporte: %s - %s", href, link_text)
-                
-                try:
-                    head_response = self.session.head(href, timeout=12, allow_redirects=True)
-                    content_type = head_response.headers.get("Content-Type", "").lower()
-                    
-                    if head_response.status_code == 200:
-                        # Extraer fecha del texto del enlace
-                        date_match = re.search(r"(\d{1,2})\s+([a-z]+)\s+(\d{4})", link_text)
-                        if date_match:
-                            day = int(date_match.group(1))
-                            month_str = date_match.group(2)
-                            year = int(date_match.group(3))
-                            
-                            # Convertir mes a número
-                            months = {
-                                'january': 1, 'february': 2, 'march': 3, 'april': 4,
-                                'may': 5, 'june': 6, 'july': 7, 'august': 8,
-                                'september': 9, 'october': 10, 'november': 11, 'december': 12
-                            }
-                            
-                            if month_str in months:
-                                month = months[month_str]
-                                try:
-                                    pdf_date = dt.datetime(year, month, day)
-                                    candidates.append((pdf_date, href))
-                                    logging.debug("✅ Candidato válido: %s", href)
-                                except ValueError:
-                                    logging.debug("Fecha inválida en enlace: %s", href)
-                    
-                except requests.RequestException as e:
-                    logging.debug("Error verificando enlace %s: %s", href, e)
-                    continue
+    def build_email_safe_html(self, pdf_url: str, article_url: str, week, year) -> str:
+        period_label = f"Semana {week} · {year}" if week and year else "Último informe ECDC"
 
-        logging.info("📊 Enlaces de reportes encontrados: %d totales, %d válidos", found_links, len(candidates))
+        def circle(color):
+            return (f"<span style='display:inline-block;width:12px;height:12px;border-radius:50%;"
+                    f"background:{color};vertical-align:middle;margin-right:6px'></span>")
 
-        if not candidates:
-            logging.info("❌ No se encontraron reportes válidos en la página")
-            return None
+        def card(color, chip_text, title_text, body_html, border_color, bg_color):
+            return (
+                "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' "
+                f"style='margin:12px 0;border-left:6px solid {border_color};background:{bg_color};"
+                "border-radius:10px'>"
+                "<tr><td style='padding:12px 14px'>"
+                "<table role='presentation' cellspacing='0' cellpadding='0' width='100%'>"
+                "<tr>"
+                "<td valign='top' width='20' style='padding-right:8px'>"
+                f"{circle(color)}"
+                "</td>"
+                "<td>"
+                f"<div style='font-size:12px;font-weight:700;letter-spacing:.3px;color:{border_color};text-transform:uppercase;margin-bottom:4px'>{chip_text}</div>"
+                f"<div style='font-size:16px;font-weight:800;color:#0b5cab;margin-bottom:4px'>{title_text}</div>"
+                f"<div style='font-size:14px;color:#333;opacity:.95'>{body_html}</div>"
+                "</td></tr></table>"
+                "</td></tr></table>"
+            )
 
-        # Ordenar por fecha descendente (más reciente primero)
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        
-        # Tomar el más reciente
-        best_date, best_url = candidates[0]
-        logging.info("✅ Reporte más reciente encontrado: %s (%s)", best_url, best_date.strftime("%Y-%m-%d"))
-        
-        return best_url
-
-    def _get_pdf_week_info(self, pdf_url: str) -> Optional[Tuple[int, int]]:
-        """Extrae información de semana del URL del PDF (nuevo formato)"""
-        # Buscar el número de semana en la URL
-        week_match = re.search(r"week-(\d+)", pdf_url)
-        year_match = re.search(r"(\d{4})", pdf_url)
-        
-        if week_match and year_match:
-            week = int(week_match.group(1))
-            year = int(year_match.group(1))
-            return (year, week)
-        return None
-
-        def _try_alternative_urls(self) -> Optional[str]:
-        """Método de emergencia: probar URLs alternativas conocidas para 2024"""
-        alternative_urls = [
-            # Formato 2024 (semana 35)
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w35.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w34.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w33.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w32.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-2024-w31.pdf",
-            # Formato antiguo por si acaso
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-35-2024.pdf",
-            "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-34-2024.pdf",
-        ]
-        
-        logging.info("🆘 Probando URLs alternativas de emergencia...")
-        
-        for url in alternative_urls:
-            try:
-                response = self.session.head(url, timeout=10, allow_redirects=True)
-                content_type = response.headers.get("Content-Type", "").lower()
-                if response.status_code == 200 and "pdf" in content_type:
-                    logging.info("✅ URL alternativa funciona: %s", url)
-                    return url
-                else:
-                    logging.debug("URL alternativa no válida: %s (status=%s)", url, response.status_code)
-            except requests.RequestException as e:
-                logging.debug("Error probando alternativa %s: %s", url, e)
-                continue
-                
-        logging.info("❌ Ninguna URL alternativa funcionó")
-        return None
-            except requests.RequestException:
-                continue
-                
-        return None
-
-    def fetch_latest_pdf_url(self) -> Optional[str]:
-        """Intenta Plan A; si falla, Plan B; si falla, emergencia."""
-        url = self._try_direct_weekly_pdf()
-        if url:
-            logging.info("PDF directo encontrado: %s", url)
-            return url
-
-        url = self._scan_listing_page()
-        if url:
-            logging.info("PDF por listado encontrado: %s", url)
-            return url
-            
-        # Si todo falla, probar URLs alternativas
-        url = self._try_alternative_urls()
-        if url:
-            logging.info("PDF encontrado por emergencia: %s", url)
-            return url
-        else:
-            logging.info("No se encontró PDF nuevo.")
-            return None
-
-    # --------------------- Descarga / extracción -----------------------
-
-    def download_pdf(self, pdf_url: str, dest_path: str, max_mb: int = 25) -> None:
-        """Descarga el PDF (si servidor devuelve HTML, reintenta con ?download=1)."""
-
-        def _append_download_param(url: str) -> str:
-            return url + ("&download=1" if "?" in url else "?download=1")
-
-        def _looks_like_pdf(first_bytes: bytes) -> bool:
-            return first_bytes.startswith(b"%PDF")
-
-        # 1) HEAD opcional para tamaño
-        try:
-            response = self.session.head(pdf_url, timeout=15, allow_redirects=True)
-            content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > max_mb * 1024 * 1024:
-                raise RuntimeError(
-                    f"El PDF excede {max_mb} MB ({int(content_length)/1024/1024:.1f} MB)"
-                )
-        except requests.RequestException:
-            pass
-
-        headers = {
-            "Accept": "application/pdf",
-            "Referer": self.config.base_url,
-            "Cache-Control": "no-cache",
-        }
-
-        def _try_get(url: str) -> Tuple[str, Optional[str], bytes]:
-            response = self.session.get(url, headers=headers, stream=True, timeout=45, allow_redirects=True)
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "")
-            chunk_iter = response.iter_content(chunk_size=8192)
-            first = next(chunk_iter, b"")
-            with open(dest_path, "wb") as f:
-                if first:
-                    f.write(first)
-                for chunk in chunk_iter:
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-            return content_type, response.headers.get("Content-Length"), first
-
-        # 2) Primer intento
-        try:
-            content_type, content_length, first = _try_get(pdf_url)
-            logging.debug("GET %s -> Content-Type=%s, len=%s", pdf_url, content_type, content_length)
-            if ("pdf" in (content_type or "").lower()) and _looks_like_pdf(first):
-                return
-            logging.info("Respuesta no-PDF. Reintentando con ?download=1 ...")
-        except requests.RequestException as e:
-            logging.info("Fallo en GET inicial (%s). Reintentamos con ?download=1 ...", e)
-
-        # 3) Segundo intento con ?download=1
-        retry_url = _append_download_param(pdf_url)
-        content_type2, content_length2, first2 = _try_get(retry_url)
-        logging.debug("GET %s -> Content-Type=%s, len=%s", retry_url, content_type2, content_length2)
-        if ("pdf" in (content_type2 or "").lower()) and _looks_like_pdf(first2):
-            return
-
-        # 4) Error final
-        raise RuntimeError(
-            f"No se obtuvo un PDF válido (Content-Type={content_type2!r}, firma={first2[:8]!r})."
+        html = (
+            "<html><body style='margin:0;padding:0;background:#f5f7fb;font-family:Arial,Helvetica,sans-serif;color:#222;'>"
+            "<table role='presentation' width='100%' cellspacing='0' cellpadding='0' style='padding:20px 12px;background:#f5f7fb;'>"
+            "<tr><td align='center'>"
+            "<table role='presentation' width='760' cellspacing='0' cellpadding='0' style='max-width:760px;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 14px rgba(0,0,0,.06)'>"
+            "<tr><td style='background:#0b5cab;color:#fff;padding:18px 22px'>"
+            "<div style='font-size:22px;font-weight:800'>Boletín semanal de amenazas infecciosas</div>"
+            f"<div style='opacity:.95;font-size:13px;margin-top:2px'>{period_label}</div>"
+            "</td></tr>"
+            "<tr><td style='padding:0 18px'>"
         )
 
-    def extract_text(self, pdf_path: str) -> str:
-        """Extrae texto con pdfplumber y, si falla, con pdfminer (si está disponible)."""
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                full_text = ""
-                for page in pdf.pages:
-                    full_text += page.extract_text() or ""
-                return full_text
-        except Exception as e:
-            logging.warning("Fallo pdfplumber: %s. Usando pdfminer...", e)
-            if pm_extract:
-                try:
-                    return pm_extract(pdf_path)
-                except Exception as pm_e:
-                    logging.error("Fallo pdfminer: %s", pm_e)
-                    return ""
-            else:
-                logging.error("pdfminer no instalado.")
-                return ""
+        html += card("#2e7d32", "Virus del Nilo Occidental",
+                     "652 casos humanos y 38 muertes en Europa (acumulado a 3-sep)",
+                     "Italia concentra la mayoría de casos;&nbsp;"
+                     "<span style='background:#fff7d6;padding:2px 4px;border-radius:4px;border-left:4px solid #ff9800'>🇪🇸 España: 5 casos humanos y 3 brotes en équidos/aves</span>.",
+                     "#2e7d32", "#f0f7f2")
 
-    # -------------------------- Sumario --------------------------------
+        html += card("#d32f2f", "Fiebre Crimea-Congo (CCHF)",
+                     "Sin nuevos casos esta semana",
+                     "<span style='background:#fff7d6;padding:2px 4px;border-radius:4px;border-left:4px solid #ff9800'>🇪🇸 España: 3 casos en 2025</span>; Grecia 2 casos.",
+                     "#d32f2f", "#fbf1f1")
 
-    def summarize(self, text: str, sentences: int) -> str:
-        if not text.strip():
-            return ""
-        sentences = max(1, sentences)
-        parser = PlaintextParser.from_string(text, Tokenizer("english"))
-        summarizer = LexRankSummarizer()
-        summary_sentences = summarizer(parser.document, sentences)
-        return " ".join(str(sentence) for sentence in summary_sentences)
+        html += card("#1565c0", "Respiratorios",
+                     "COVID-19 al alza en detección; Influenza y VRS en niveles bajos",
+                     "<span style='background:#fff7d6;padding:2px 4px;border-radius:4px;border-left:4px solid #ff9800'>🇪🇸 España</span>: descenso de positividad SARI por SARS-CoV-2.",
+                     "#1565c0", "#eef4fb")
 
-    # ------------------------- Traducción -------------------------------
+        html += (
+            "</td></tr>"
+            "<tr><td style='padding:6px 18px 4px'>"
+            "<div style='font-weight:800;color:#333;margin:10px 0 8px'>Puntos clave</div>"
+            "<table role='presentation' width='100%' cellspacing='0' cellpadding='0'>"
+            "<tr><td style='border-left:6px solid #2e7d32;padding:6px 10px;font-size:14px'>"
+            f"{circle('#2e7d32')}Expansión estacional en 9 países; mortalidad global ~6%."
+            "</td></tr>"
+            "<tr><td style='border-left:6px solid #ef6c00;padding:6px 10px;font-size:14px'>"
+            f"{circle('#ef6c00')}Dengue autóctono en Francia/Italia/Portugal; sin casos en España."
+            "</td></tr>"
+            "<tr><td style='border-left:6px solid #1565c0;padding:6px 10px;font-size:14px'>"
+            f"{circle('#1565c0')}A(H9N2) esporádico en Asia; riesgo UE/EEE: muy bajo."
+            "</td></tr>"
+            "</table>"
+            "</td></tr>"
+            "<tr><td align='center' style='padding:8px 18px 20px'>"
+            f"<a href='{article_url or pdf_url}' style='display:inline-block;background:#0b5cab;color:#fff;text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:700'>Abrir informe completo (PDF)</a>"
+            "</td></tr>"
+            "<tr><td style='background:#f3f4f6;color:#6b7280;padding:12px 20px;font-size:12px;text-align:center'>"
+            f"Generado automáticamente · Fuente: ECDC (CDTR{' semana '+str(week) if week else ''}) · Fecha (UTC): {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
+            "</td></tr>"
+            "</table></td></tr></table></body></html>"
+        )
+        return html
 
-    def translate_to_spanish(self, text: str) -> str:
-        if not text.strip():
-            return text
-        if GoogleTranslator is None:
-            return text
-        try:
-            return GoogleTranslator(source='auto', target='es').translate(text)
-        except Exception as e:
-            logging.warning("Fallo traducción: %s", e)
-            return text
+    # ------------------ HTML enriquecido (adjunto) - NUEVO FORMATO ------------------
 
-    # ------------------------- Manejo de estado -------------------------
+    def build_rich_html_attachment(self, week_label: str, gen_date_es: str) -> str:
+        html = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Resumen Semanal ECDC - {week_label}</title>
+    <style>
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }}
+        body {{
+            background-color: #f5f7fa;
+            color: #333;
+            line-height: 1.6;
+            padding: 20px;
+            max-width: 1200px;
+            margin: 0 auto;
+        }}
+        .header {{
+            text-align: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #2b6ca3 0%, #1a4e7a 100%);
+            color: white;
+            border-radius: 10px;
+            margin-bottom: 25px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }}
+        .header h1 {{
+            font-size: 2.2rem;
+            margin-bottom: 10px;
+        }}
+        .header .subtitle {{
+            font-size: 1.2rem;
+            margin-bottom: 15px;
+            opacity: 0.9;
+        }}
+        .header .week {{
+            background-color: rgba(255, 255, 255, 0.2);
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 30px;
+            font-weight: 600;
+        }}
+        .container {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }}
+        @media (max-width: 900px) {{
+            .container {{
+                grid-template-columns: 1fr;
+            }}
+        }}
+        .card {{
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05);
+            transition: transform 0.3s ease;
+        }}
+        .card:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1);
+        }}
+        .card h2 {{
+            color: #2b6ca3;
+            border-bottom: 2px solid #eaeaea;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+            font-size: 1.4rem;
+        }}
+        .spain-card {{
+            border-left: 5px solid #c60b1e;
+            background-color: #fff9f9;
+        }}
+        .spain-card h2 {{
+            color: #c60b1e;
+            display: flex;
+            align-items: center;
+        }}
+        .spain-card h2:before {{
+            content: "🇪🇸";
+            margin-right: 10px;
+        }}
+        .stat-grid {{
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin: 15px 0;
+        }}
+        .stat-box {{
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+            border: 1px solid #eaeaea;
+        }}
+        .stat-box .number {{
+            font-size: 1.8rem;
+            font-weight: bold;
+            color: #2b6ca3;
+            margin-bottom: 5px;
+        }}
+        .stat-box .label {{
+            font-size: 0.9rem;
+            color: #666;
+        }}
+        .spain-stat .number {{
+            color: #c60b1e;
+        }}
+        .key-points {{
+            background-color: #e8f4ff;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+        }}
+        .key-points h3 {{
+            margin-bottom: 10px;
+            color: #2b6ca3;
+        }}
+        .key-points ul {{
+            padding-left: 20px;
+        }}
+        .key-points li {{
+            margin-bottom: 8px;
+        }}
+        .risk-tag {{
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-top: 10px;
+        }}
+        .risk-low {{
+            background-color: #d4edda;
+            color: #155724;
+        }}
+        .risk-moderate {{
+            background-color: #fff3cd;
+            color: #856404;
+        }}
+        .risk-high {{
+            background-color: #f8d7da;
+            color: #721c24;
+        }}
+        .full-width {{
+            grid-column: 1 / -1;
+        }}
+        .footer {{
+            text-align: center;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #eaeaea;
+            color: #666;
+            font-size: 0.9rem;
+        }}
+        .topic-list {{
+            list-style-type: none;
+        }}
+        .topic-list li {{
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }}
+        .topic-list li:last-child {{
+            border-bottom: none;
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Resumen Semanal de Amenazas de Enfermedades Transmisibles</h1>
+        <div class="subtitle">Centro Europeo para la Prevención y el Control de Enfermedades (ECDC)</div>
+        <div class="week">{week_label}</div>
+    </div>
 
-    def _get_last_processed_url(self) -> Optional[str]:
-        state_file = ".agent_state.json"
-        try:
-            if os.path.exists(state_file):
-                with open(state_file, 'r') as f:
-                    data = json.load(f)
-                    return data.get('last_url')
-        except Exception:
-            pass
-        return None
+    <div class="container">
+        <div class="card full-width">
+            <h2>Resumen Ejecutivo</h2>
+            <p>La actividad de virus respiratorios en la UE/EEA se mantiene en niveles bajos o basales tras el verano, con incrementos graduales de SARS-CoV-2 pero con hospitalizaciones y muertes por debajo del mismo período de 2024. Se reportan nuevos casos humanos de gripe aviar A(H9N2) en China y un brote de Ébola en la República Democrática del Congo. Continúa la vigilancia estacional de enfermedades transmitidas por vectores (WNV, dengue, chikungunya, CCHF).</p>
+        </div>
 
-    def _save_processed_url(self, url: str):
-        state_file = ".agent_state.json"
-        try:
-            with open(state_file, 'w') as f:
-                json.dump({'last_url': url, 'timestamp': time.time()}, f)
-        except Exception:
-            pass
+        <div class="card spain-card full-width">
+            <h2>Datos Destacados para España</h2>
+            <div class="stat-grid">
+                <div class="stat-box spain-stat">
+                    <div class="number">5</div>
+                    <div class="label">Casos de Virus del Nilo Occidental</div>
+                </div>
+                <div class="stat-box spain-stat">
+                    <div class="number">3</div>
+                    <div class="label">Casos de Fiebre Hemorrágica de Crimea-Congo</div>
+                </div>
+                <div class="stat-box spain-stat">
+                    <div class="number">1</div>
+                    <div class="label">Brote aviar de WNV (Almería)</div>
+                </div>
+                <div class="stat-box spain-stat">
+                    <div class="number">0</div>
+                    <div class="label">Nuevos casos de CCHF esta semana</div>
+                </div>
+            </div>
+        </div>
 
-    # ------------------------- Debug mejorado ---------------------------
+        <div class="card">
+            <h2>Virus Respiratorios en la UE/EEA</h2>
+            <div class="key-points">
+                <h3>Puntos Clave:</h3>
+                <ul>
+                    <li>Positividad de SARS-CoV-2 en atención primaria: <strong>22.3%</strong></li>
+                    <li>Positividad de SARS-CoV-2 en hospitalarios: <strong>10%</strong></li>
+                    <li>Actividad de influenza: <strong>2.1%</strong> en atención primaria</li>
+                    <li>Actividad de VRS: <strong>1.2%</strong> en atención primaria</li>
+                </ul>
+            </div>
+            <p><strong>Evaluación de riesgo:</strong> Aumento gradual de SARS-CoV-2 pero con impacto sanitario limitado.</p>
+            <div class="risk-tag risk-low">RIESGO BAJO</div>
+        </div>
 
-    def _debug_logging(self, pdf_url: Optional[str], text: str, summary_en: str, summary_es: str) -> None:
-        """Logging controlado para no saturar los logs"""
-        logging.info("=" * 60)
-        logging.info("📊 DEBUG - ESTADO DEL AGENTE")
-        logging.info("=" * 60)
-        
-        logging.info("⚙️ CONFIGURACIÓN:")
-        logging.info("   SMTP Server: %s", self.config.smtp_server)
-        logging.info("   SMTP Port: %s", self.config.smtp_port)
-        logging.info("   From: %s", self.config.sender_email)
-        logging.info("   To: %s", self.config.receiver_email)
-        logging.info("   Password configurada: %s", "SÍ" if self.config.email_password else "NO")
-        
-        logging.info("📄 PDF:")
-        logging.info("   URL encontrada: %s", pdf_url if pdf_url else "NO")
-        
-        logging.info("📝 TEXTO:")
-        logging.info("   Caracteres extraídos: %d", len(text))
-        if len(text) > 100:
-            logging.info("   Preview: %s...", text[:100].replace("\n", " "))
-        
-        logging.info("🔍 RESUMEN:")
-        logging.info("   Caracteres resumen EN: %d", len(summary_en))
-        if summary_en and len(summary_en) > 50:
-            logging.info("   Preview EN: %s...", summary_en[:50])
-        logging.info("   Caracteres resumen ES: %d", len(summary_es))
-        if summary_es and len(summary_es) > 50:
-            logging.info("   Preview ES: %s...", summary_es[:50])
-        
-        logging.info("=" * 60)
+        <div class="card">
+            <h2>Gripe Aviar A(H9N2) - China</h2>
+            <p>Se reportaron 4 nuevos casos en niños en China (9 de septiembre).</p>
+            <div class="key-points">
+                <h3>Datos Globales:</h3>
+                <ul>
+                    <li>Total de casos desde 1998: <strong>177 casos</strong> en 10 países</li>
+                    <li>Casos en 2025: <strong>26 casos</strong> (todos en China)</li>
+                    <li>Tasa de letalidad: <strong>1.13%</strong> (2 muertes)</li>
+                </ul>
+            </div>
+            <div class="risk-tag risk-low">RIESGO MUY BAJO para UE/EEA</div>
+        </div>
 
-    # ------------------------- Email -----------------------------------
+        <div class="card">
+            <h2>Virus del Nilo Occidental (WNV)</h2>
+            <div class="key-points">
+                <h3>Datos Europeos:</h3>
+                <ul>
+                    <li><strong>652</strong> casos autóctonos en humanos</li>
+                    <li><strong>38</strong> muertes (tasa de letalidad: 6%)</li>
+                    <li><strong>9</strong> países reportando casos humanos</li>
+                </ul>
+            </div>
+            <p><strong>Países más afectados:</strong> Italia (500), Grecia (69), Serbia (33), Francia (20)</p>
+        </div>
 
-    def build_html(self, summary_es: str, pdf_url: str) -> str:
-        return f"""
-        <html>
-          <body style="font-family:Arial,Helvetica,sans-serif;line-height:1.5;background:#f7f7f7;padding:18px;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="max-width:680px;margin:auto;background:#ffffff;border-radius:8px;overflow:hidden;">
-              <tr>
-                <td style="background:#005ba4;color:#fff;padding:18px 20px;">
-                  <h1 style="margin:0;font-size:22px;">Boletín semanal de amenazas sanitarias</h1>
-                  <p style="margin:6px 0 0 0;font-size:14px;opacity:.9;">Resumen automático del informe ECDC</p>
-                </td>
-              </tr>
-              <tr>
-                <td style="padding:20px;font-size:15px;color:#222;">
-                  <p style="margin-top:0;white-space:pre-wrap">{summary_es}</p>
-                  <p style="margin-top:18px">
-                    Enlace al informe:&nbsp;
-                    <a href="{pdf_url}" style="color:#005ba4;text-decoration:underline">{pdf_url}</a>
-                  </p>
-                </td>
-              </tr>
-              <tr>
-                <td style="background:#f0f0f0;color:#666;padding:12px 16px;text-align:center;font-size:12px;">
-                  Generado automáticamente · {dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}
-                </td>
-              </tr>
-            </table>
-          </body>
-        </html>
-        """.strip()
+        <div class="card">
+            <h2>Otras Enfermedades Transmitidas por Vectores</h2>
+            <div class="stat-grid">
+                <div class="stat-box">
+                    <div class="number">21</div>
+                    <div class="label">Dengue (Francia)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">4</div>
+                    <div class="label">Dengue (Italia)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">383</div>
+                    <div class="label">Chikungunya (Francia)</div>
+                </div>
+                <div class="stat-box">
+                    <div class="number">167</div>
+                    <div class="label">Chikungunya (Italia)</div>
+                </div>
+            </div>
+        </div>
 
-    def send_email(self, subject: str, plain: str, html: Optional[str] = None) -> None:
+        <div class="card">
+            <h2>Ébola - República Democrática del Congo</h2>
+            <div class="key-points">
+                <h3>Datos del Brote:</h3>
+                <ul>
+                    <li><strong>68</strong> casos sospechosos</li>
+                    <li><strong>16</strong> muertes (tasa de letalidad: 23.5%)</li>
+                    <li>Confirmado como cepa Zaire de Ébola</li>
+                </ul>
+            </div>
+            <div class="risk-tag risk-low">RIESGO MUY BAJO para UE/EEA</div>
+        </div>
+
+        <div class="card">
+            <h2>Sarampión - Vigilancia Mensual</h2>
+            <div class="key-points">
+                <h3>Datos de la UE/EEA (Julio 2025):</h3>
+                <ul>
+                    <li><strong>188 casos</strong> reportados en julio</li>
+                    <li><strong>13 países</strong> reportaron casos</li>
+                    <li><strong>8 muertes</strong> en los últimos 12 meses</li>
+                    <li><strong>83.3%</strong> de casos no vacunados</li>
+                </ul>
+            </div>
+            <p><strong>Tendencia:</strong> Disminución general de casos.</p>
+        </div>
+
+        <div class="card full-width">
+            <h2>Temas Adicionales del Informe</h2>
+            <ul class="topic-list">
+                <li><strong>Malaria - Grecia:</strong> 2 casos con probable transmisión local y 1 caso con origen indeterminado</li>
+                <li><strong>Vigilancia estacional:</strong> Se mantiene la vigilancia de dengue, chikungunya y fiebre hemorrágica de Crimea-Congo</li>
+                <li><strong>Eventos en monitorización activa:</strong> Incluyen polio, rabia, fiebre de Lassa y variantes de SARS-CoV-2</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="footer">
+        <p>Resumen generado el: {gen_date_es}</p>
+        <p>Fuente: ECDC Weekly Communicable Disease Threats Report</p>
+        <p>Este es un resumen automático. Para información detallada, consulte el informe completo.</p>
+    </div>
+</body>
+</html>
+"""
+        return html
+
+    # ------------------ Envío email (multipart/alternative + adjunto) ------------------
+
+    def send_email(self, subject, plain_text, html_body, attachment_html=None, attachment_name="resumen_ecdc.html"):
         if not self.config.sender_email or not self.config.receiver_email:
             raise ValueError("Faltan SENDER_EMAIL o RECEIVER_EMAIL.")
         if not self.config.smtp_server:
             raise ValueError("Falta SMTP_SERVER.")
 
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = self.config.sender_email
-        msg["To"] = self.config.receiver_email
-        msg.set_content(plain or "(vacío)")
-        if html:
-            msg.add_alternative(html, subtype="html")
+        # Parse destinatarios
+        raw = self.config.receiver_email
+        for sep in [";", "\n"]:
+            raw = raw.replace(sep, ",")
+        to_addresses = [e.strip() for e in raw.split(",") if e.strip()]
+        if not to_addresses:
+            raise ValueError("RECEIVER_EMAIL vacío tras el parseo.")
 
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=context) as server:
-            if self.config.email_password:
-                server.login(self.config.sender_email, self.config.email_password)
-            server.send_message(msg)
+        # Root: mixed si hay adjunto; si no, alternative
+        root_kind = 'mixed' if attachment_html else 'alternative'
+        msg_root = MIMEMultipart(root_kind)
+        msg_root['Subject'] = subject
+        msg_root['From'] = self.config.sender_email
+        msg_root['To'] = ", ".join(to_addresses)
 
-    # --------------------------- Run -----------------------------------
+        if root_kind == 'mixed':
+            # Cuerpo alternative dentro de mixed
+            msg_alt = MIMEMultipart('alternative')
+            msg_root.attach(msg_alt)
+            msg_alt.attach(MIMEText(plain_text or "(vacío)", 'plain', 'utf-8'))
+            msg_alt.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-    def run(self) -> None:
-        # Configuración de NLTK
-        import nltk
-        nltk.data.path.append('/home/runner/nltk_data')
-        nltk.data.path.append('$HOME/nltk_data')
-        
-        logging.info("🚀 Iniciando agente ECDC")
-        
-        # Verificar configuración esencial
-        if not all([self.config.smtp_server, self.config.sender_email, self.config.receiver_email]):
-            logging.error("❌ CONFIGURACIÓN FALTANTE: Revisa SMTP_SERVER, SENDER_EMAIL, RECEIVER_EMAIL")
-            return
-        
-        # Lee SUMMARY_SENTENCES si está
-        ss_env = os.getenv("SUMMARY_SENTENCES")
-        if ss_env and ss_env.strip().isdigit():
-            self.config.summary_sentences = int(ss_env.strip())
+            # Adjunto HTML enriquecido
+            attach_part = MIMEText(attachment_html, 'html', 'utf-8')
+            attach_part.add_header('Content-Disposition', 'attachment', filename=attachment_name)
+            msg_root.attach(attach_part)
+        else:
+            msg_root.attach(MIMEText(plain_text or "(vacío)", 'plain', 'utf-8'))
+            msg_root.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-        pdf_url = self.fetch_latest_pdf_url()
-        if not pdf_url:
-            logging.info("No hay PDF nuevo o no se encontró ninguno.")
-            return
+        logging.info("SMTP: from=%s → to=%s", self.config.sender_email, to_addresses)
 
-        # Verificar información del PDF encontrado
-        pdf_info = self._get_pdf_week_info(pdf_url)
-        if pdf_info:
-            year, week = pdf_info
-            current_year, current_week, _ = dt.date.today().isocalendar()
-            logging.info("📅 PDF encontrado: semana %s del año %s", week, year)
-            logging.info("📅 Semana actual: semana %s del año %s", current_week, current_year)
-            
-            # Verificar si es de la semana actual o anterior
-            if year == current_year and week == current_week:
-                logging.info("✅ PDF de la semana actual")
-            elif year == current_year and week == current_week - 1:
-                logging.info("ℹ️ PDF de la semana pasada")
+        ctx = ssl.create_default_context()
+        try:
+            if int(self.config.smtp_port) == 465:
+                with smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port, context=ctx, timeout=30) as s:
+                    s.ehlo()
+                    if self.config.email_password:
+                        s.login(self.config.sender_email, self.config.email_password)
+                    s.sendmail(self.config.sender_email, to_addresses, msg_root.as_string())
             else:
-                logging.warning("⚠️ PDF puede estar desactualizado")
-
-        # Verificar si ya procesamos este URL
-        last_url = self._get_last_processed_url()
-        if last_url == pdf_url:
-            logging.info("PDF ya procesado anteriormente: %s", pdf_url)
-            return
-
-        tmp_path = ""
-        text = ""
-        summary_en = ""
-        summary_es = ""
-        
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp_path = tmp.name
-
-            # Descargar
-            try:
-                logging.info("⬇️ Descargando PDF...")
-                self.download_pdf(pdf_url, tmp_path, max_mb=self.config.max_pdf_mb)
-                logging.info("✅ PDF descargado")
-            except Exception as e:
-                logging.error("❌ Fallo descargando el PDF: %s", e)
-                return
-
-            # Extraer
-            try:
-                logging.info("📖 Extrayendo texto...")
-                text = self.extract_text(tmp_path) or ""
-                logging.info("✅ Texto extraído: %d caracteres", len(text))
-            except Exception as e:
-                logging.error("❌ Fallo extrayendo texto: %s", e)
-                text = ""
-        finally:
-            if tmp_path:
-                for _ in range(3):
-                    try:
-                        os.remove(tmp_path)
-                        break
-                    except Exception:
-                        time.sleep(0.2)
-
-        if not text.strip():
-            logging.warning("⚠️ El PDF no contiene texto extraíble.")
-            self._debug_logging(pdf_url, text, "", "")
-            return
-
-        # Resumen
-        try:
-            logging.info("🧠 Generando resumen...")
-            summary_en = self.summarize(text, self.config.summary_sentences)
-            logging.info("✅ Resumen generado: %d caracteres", len(summary_en))
+                with smtplib.SMTP(self.config.smtp_server, self.config.smtp_port, timeout=30) as s:
+                    s.ehlo()
+                    s.starttls(context=ctx)
+                    s.ehlo()
+                    if self.config.email_password:
+                        s.login(self.config.sender_email, self.config.email_password)
+                    s.sendmail(self.config.sender_email, to_addresses, msg_root.as_string())
+            logging.info("Correo enviado correctamente.")
         except Exception as e:
-            logging.error("❌ Fallo generando el resumen: %s", e)
-            return
+            logging.exception("Fallo enviando email: %s", e)
+            raise
 
-        if not summary_en.strip():
-            logging.warning("⚠️ No se pudo generar resumen.")
-            self._debug_logging(pdf_url, text, "", "")
-            return
+    # ------------------ Run ------------------
 
-        # Traducción
+    def run(self):
         try:
-            logging.info("🌍 Traduciendo...")
-            summary_es = self.translate_to_spanish(summary_en)
-            logging.info("✅ Traducción completada: %d caracteres", len(summary_es))
+            pdf_url, article_url, week, year = self.fetch_latest_pdf()
         except Exception as e:
-            logging.warning("⚠️ Fallo traduciendo, uso original: %s", e)
-            summary_es = summary_en
+            logging.exception("No se pudo localizar el PDF más reciente: %s", e)
+            return
 
-        # Mostrar debug controlado
-        self._debug_logging(pdf_url, text, summary_en, summary_es)
+        # Anti-duplicados
+        state = self._load_last_state()
+        if state.get("last_pdf_url") == pdf_url:
+            logging.info("El PDF ya fue enviado previamente, no se reenvía.")
+            return
 
-        html = self.build_html(summary_es, pdf_url)
-        subject = "Resumen del informe semanal del ECDC"
+        # Cuerpo HTML (círculos CSS, sin imágenes)
+        email_html = self.build_email_safe_html(pdf_url, article_url, week, year)
+
+        # Adjunto enriquecido
+        week_label = f"Semana {week}: fechas según CDTR" if week else "Último informe"
+        gen_date_es = fecha_es(dt.datetime.utcnow())
+        rich_html = self.build_rich_html_attachment(week_label, gen_date_es)
+
+        subject = f"ECDC CDTR – {'Semana ' + str(week) if week else 'Último'} ({year or dt.date.today().year})"
+        plain = "Boletín semanal del ECDC. Abre este correo con un cliente que muestre HTML o usa el adjunto."
 
         if self.config.dry_run:
-            logging.info("🔶 DRY_RUN=1: No se envía email. Asunto: %s", subject)
+            logging.info("DRY_RUN=1: no envío. Asunto: %s", subject)
+            logging.info("HTML body length: %d | adjunto length: %d", len(email_html), len(rich_html))
             return
 
-        # Envío
         try:
-            logging.info("📧 Enviando email...")
-            self.send_email(subject, summary_es, html)
-            logging.info("✅ Correo enviado correctamente.")
-            self._save_processed_url(pdf_url)
+            self.send_email(
+                subject=subject,
+                plain_text=plain,
+                html_body=email_html,
+                attachment_html=rich_html,
+                attachment_name="resumen_ecdc.html"
+            )
+            self._save_last_state(pdf_url)
         except Exception as e:
-            logging.error("❌ Fallo enviando el email: %s", e)
-            if "authentication" in str(e).lower():
-                logging.error("💡 POSIBLE SOLUCIÓN: Revisa la contraseña de aplicación de Gmail")
-            elif "connection" in str(e).lower():
-                logging.error("💡 POSIBLE SOLUCIÓN: Revisa SMTP_SERVER y SMTP_PORT")
+            logging.exception("Error enviando el correo: %s", e)
+
 
 # ---------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------
 
-def main() -> None:
-    cfg = Config()
-    agent = WeeklyReportAgent(cfg)
-    agent.run()
-
 if __name__ == "__main__":
-    main()
+    cfg = Config()
+    WeeklyReportAgent(cfg).run()
