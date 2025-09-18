@@ -1,18 +1,29 @@
-name: Enviar resumen semanal del ECDC
+name: Weekly ECDC CDTR Mailer
 
 on:
-  workflow_dispatch:          # puedes lanzarlo a mano
+  # ✅ Ejecución automática semanal (miércoles 09:00 UTC)
   schedule:
-    - cron: "0 8 * * 1"       # lunes 08:00 UTC
+    - cron: "0 9 * * 3"
+  # ✅ Botón para lanzarlo manualmente cuando quieras
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly-ecdc-cdtr
+  cancel-in-progress: false
 
 jobs:
-  ecdc:
+  run-agent:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - name: Checkout repo
+      - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -20,57 +31,23 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # Por si no hay requirements.txt, instala mínimos
+            pip install requests beautifulsoup4
+          fi
 
-      - name: Download ALL required NLTK data
-        run: |
-          python -c "
-          import nltk
-          nltk.download('punkt', download_dir='$HOME/nltk_data')
-          nltk.download('stopwords', download_dir='$HOME/nltk_data')
-          nltk.download('punkt_tab', download_dir='$HOME/nltk_data')
-          nltk.download('averaged_perceptron_tagger', download_dir='$HOME/nltk_data')
-          nltk.download('wordnet', download_dir='$HOME/nltk_data')
-          nltk.download('omw-1.4', download_dir='$HOME/nltk_data')
-          print('✅ Todos los datos de NLTK descargados')
-          "
-
-      - name: Debug - Test PDF URLs manually
-        run: |
-          echo "=== 🔍 TEST MANUAL DE URLs PDF ==="
-          echo "Probando semana 35-2024:"
-          curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-35-2024.pdf" | head -5
-          echo ""
-          echo "Probando semana 34-2024:"
-          curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-34-2024.pdf" | head -5
-          echo ""
-          echo "Probando semana 33-2024:"
-          curl -s -I "https://www.ecdc.europa.eu/sites/default/files/documents/communicable-disease-threats-report-week-33-2024.pdf" | head -5
-          echo "=== FIN TEST ==="
-
-      - name: Debug - Check listing page content
-        run: |
-          echo "=== 🔍 CONTENIDO DE LA PÁGINA DE LISTADOS ==="
-          curl -s "https://www.ecdc.europa.eu/en/publications-and-data/monitoring/weekly-threats-reports" | grep -o 'https://[^"]*\.pdf' | head -10 || echo "No se encontraron PDFs en la página"
-          echo "=== FIN CONTENIDO ==="
-
-      - name: Run agent (DEBUG mode)
+      - name: Run weekly agent
         env:
-          LOG_LEVEL: DEBUG  # Modo DEBUG para ver detalles
+          LOG_LEVEL: INFO
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        run: python weekly_agent.py
-
-      - name: Show final status
-        if: always()
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          # DRY_RUN: "1"   # ← déjalo comentado; úsalo si quieres probar sin enviar
         run: |
-          echo "=== 📊 ESTADO FINAL ==="
-          echo "Workflow completado - Revisa los logs anteriores para detalles"
-          echo "Si no se encontró PDF, puede que:"
-          echo "1. El ECDC no haya publicado el informe aún"
-          echo "2. La URL del PDF haya cambiado"
-          echo "3. Necesitemos ajustar la búsqueda"
-          echo "==="
+          python weekly_agent.py weekly_agent.py
+
+
